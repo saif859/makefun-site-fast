@@ -4,10 +4,19 @@
 [![rank](https://make.fun/badge/site-generator-speed-01-run-20261122/saif859/makefun-site-fast/rank.svg)](https://make.fun/bounty/site-generator-speed-01-run-20261122/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=site-generator-speed-01-run-20261122)
 [![reward](https://make.fun/badge/site-generator-speed-01-run-20261122/saif859/makefun-site-fast/reward.svg)](https://make.fun/bounty/site-generator-speed-01-run-20261122?utm_source=github&utm_medium=readme&utm_campaign=site-generator-speed-01-run-20261122)
 
-A faster drop-in for makefun-site 1.0.0: `run(input)` in `solve.js` returns the same output tree, byte for byte
-(every page, the index and tag pages, `build-report.txt` and the static files), with well under half the CPU time.
+A faster drop-in for makefun-site 1.0.0: the same output tree, byte for byte (every page, the index and tag pages,
+`build-report.txt` and the static files), for a fraction of the CPU time.
 
-How it saves time, keeping every makefun-site rule:
+The build runs in Rust compiled to WebAssembly (`sitegen/`, built to `sitegen.wasm`): `main.ts` hands it the bytes of
+`cases.json` and writes the answers it returns. It reads the JSON itself, works on UTF-8 bytes throughout, renders the
+templates straight into the inside of each JSON string and never builds a JavaScript string of the output. Only slugs of
+non-ASCII text call back into JavaScript (for its NFKD normalization). V8 runs the module on its baseline compiler
+alone (`--liftoff-only`): for a one-pass build, optimizing hot functions costs more compiler-thread CPU than it saves.
+
+Everything else is `solve.js`, the JavaScript build it falls back to: for input the WebAssembly build does not take
+exactly (invalid UTF-8, U+2028 or U+2029, a `\u` escape of a non-ASCII character, an odd `per_page` or `recent`, a static
+file whose path is all digits or `build-report.txt`), or if it fails at all. How `solve.js` saves time, keeping every
+makefun-site rule:
 
 - Templates are compiled once per build into closures, with every name's scope resolved at compile time.
 - A template piece that reads only build-wide values (`site`, `tags`, `recent`) is rendered once per build; an include
@@ -33,6 +42,12 @@ MAKEFUN_INPUT_DIR=<dir holding cases.json> MAKEFUN_OUTPUT_DIR=<output dir> node 
 ```
 
 `main.ts` needs Node.js 22.18 or later (it runs TypeScript as it is); `solve.js` is a dependency-free ES module.
+
+To rebuild `sitegen.wasm` (no dependencies; Rust with the `wasm32-unknown-unknown` target):
+
+```sh
+cd sitegen && cargo build --release --target wasm32-unknown-unknown && cp target/wasm32-unknown-unknown/release/sitegen.wasm ..
+```
 
 ---
 

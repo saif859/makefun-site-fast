@@ -1372,6 +1372,16 @@ export function run(input) {
   return output;
 }
 
+/** makefun-site's slug of one-byte text (for the WebAssembly build's non-ASCII titles, tags and headings). */
+export function slugL1(text) {
+  L1 = true;
+  try {
+    return slugifyRaw(text);
+  } finally {
+    L1 = false;
+  }
+}
+
 /** run on one-byte text (see "one-byte text" above): the same tree as one-byte text. */
 export function runL1(input) {
   L1 = true;

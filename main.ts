@@ -15,7 +15,32 @@ setFlagsFromString('--no-incremental-marking');
 setFlagsFromString('--liftoff-only');
 
 type Run = (input: unknown) => unknown;
-const { run, runL1, slugL1 } = (await import(new URL('./solve.js', import.meta.url).href)) as { run: Run; runL1: Run; slugL1: (text: string) => string };
+/** solve.js, loaded only when it builds a case. */
+const loadSolve = async (): Promise<{ run: Run; runL1: Run }> => (await import(new URL('./solve.js', import.meta.url).href)) as { run: Run; runL1: Run };
+
+const MARKS = /\p{M}/gu;
+/** makefun-site's slug of non-ASCII text (as solve.js's slugifyRaw): NFKD, marks dropped, A-Z lowered, runs of other characters one "-", at most 64, "untitled". */
+const slugOf = (text: string): string => {
+  const plain = text.normalize('NFKD').replace(MARKS, '');
+  let out = '';
+  let gap = false;
+  for (let i = 0; i < plain.length; i++) {
+    let c = plain.charCodeAt(i);
+    if (c >= 65 && c <= 90) c += 32;
+    else if (!((c >= 97 && c <= 122) || (c >= 48 && c <= 57))) {
+      gap = out.length > 0;
+      continue;
+    }
+    if (gap) out += '-';
+    gap = false;
+    out += String.fromCharCode(c);
+  }
+  if (out.length > 64) {
+    out = out.slice(0, 64);
+    if (out.charCodeAt(63) === 45) out = out.slice(0, 63);
+  }
+  return out === '' ? 'untitled' : out;
+};
 
 const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
 const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
@@ -36,7 +61,6 @@ const escapesNonAscii = (b: Buffer): boolean => {
 // U+2028 or U+2029 and no \u escape of a non-ASCII character; anything else goes the ordinary way.
 const oneByte = isUtf8(bytes) && bytes.indexOf('\u2028') === -1 && bytes.indexOf('\u2029') === -1 && !escapesNonAscii(bytes);
 const ENC: BufferEncoding = oneByte ? 'latin1' : 'utf8';
-const solve: Run = oneByte ? runL1 : run;
 
 type Case = { id: string; input: unknown } | null;
 
@@ -52,7 +76,7 @@ const buildWasm = (): Built | null => {
       // A slug of non-ASCII text, by solve.js (JavaScript's NFKD): its ASCII written at `out`, its length returned.
       js_slug: (p: number, n: number, out: number): number => {
         const m = new Uint8Array(memory!.buffer);
-        const slug = slugL1(Buffer.from(m.buffer, p, n).toString('latin1'));
+        const slug = slugOf(Buffer.from(m.buffer, p, n).toString('utf8'));
         for (let k = 0; k < slug.length; k++) m[out + k] = slug.charCodeAt(k);
         return slug.length;
       },
@@ -78,6 +102,11 @@ const buildWasm = (): Built | null => {
   }
 };
 const built = oneByte ? buildWasm() : null;
+let solve: Run = () => null;
+if (built === null || built.answers.some((a) => a === null)) {
+  const m = await loadSolve();
+  solve = oneByte ? m.runL1 : m.run;
+}
 if (process.env.SITEGEN_TRACE) process.stderr.write(`sitegen: ${built === null ? 'not used' : `${built.answers.filter((a) => a !== null).length} of ${built.answers.length} cases`}\n`);
 let parsed: Case[] | null = null;
 /** The cases, parsed (when solve.js builds any). */

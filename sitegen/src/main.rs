@@ -7,9 +7,8 @@ fn main() {
     if args.len() != 3 && args.len() != 5 {
         std::process::exit(2);
     }
-    let built = std::fs::read(&args[1]).ok().and_then(|mut bytes| sitegen::build_all(&mut bytes));
-    if let Some(out) = built {
-        if std::fs::write(&args[2], out).is_ok() {
+    if let Ok(mut bytes) = std::fs::read(&args[1]) {
+        if sitegen::build_to_file(&mut bytes, &args[2]) {
             return;
         }
     }

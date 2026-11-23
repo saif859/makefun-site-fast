@@ -127,11 +127,11 @@ static ALLOC: arena::Arena = arena::Arena::new();
 
 /// One case built into `out` (its answer's JSON object): whether it was, every block it took given back after (out
 /// was made big enough beforehand; if it had to grow, nothing is given back).
-fn build_case(j: &json::J, out: &mut Vec<u8>) -> bool {
+fn build_case(j: &json::J, out: &mut Vec<u8>, flush: &mut dyn FnMut(&mut Vec<u8>)) -> bool {
     let mark = ALLOC.mark();
     let cap = out.capacity();
     let ok = match build::Input::from_json(j) {
-        Some(inp) => build::run(&inp, out),
+        Some(inp) => build::run(&inp, out, flush),
         None => false,
     };
     if out.capacity() == cap {
@@ -165,7 +165,7 @@ pub extern "C" fn build(p: *mut u8, n: usize) -> i32 {
     let mut cases = Vec::with_capacity(inputs.len());
     for j in &inputs {
         let start = out.len();
-        let ok = build_case(j, &mut out);
+        let ok = build_case(j, &mut out, &mut |_: &mut Vec<u8>| {});
         if !ok {
             out.truncate(start);
         }
@@ -179,6 +179,53 @@ pub extern "C" fn build(p: *mut u8, n: usize) -> i32 {
 
 /// The answers file (the JSON array of every case's answer) when this build takes every case of cases.json exactly,
 /// else None: valid UTF-8 with no U+2028 or U+2029 (which a regex "." stops at), as main.js's one-byte check asks.
+/// Whether this build reads the input at all: valid UTF-8 with no U+2028 or U+2029 (which a regex "." stops at).
+fn readable(src: &[u8]) -> bool {
+    if std::str::from_utf8(src).is_err() {
+        return false;
+    }
+    let mut at = 0;
+    while let Some(k) = text::find_byte(&src[at..], 0xe2) {
+        let i = at + k;
+        if src.get(i + 1) == Some(&0x80) && matches!(src.get(i + 2), Some(&0xa8) | Some(&0xa9)) {
+            return false;
+        }
+        at = i + 1;
+    }
+    true
+}
+
+/// The answers file written to `path`, streamed through a small buffer, when this build takes every case of
+/// cases.json exactly: true. False otherwise, and the file may then hold part of it (main.js writes it anew).
+pub fn build_to_file(src: &mut [u8], path: &str) -> bool {
+    use std::io::Write;
+    if !readable(src) {
+        return false;
+    }
+    let Some(inputs) = json::parse_cases(src) else { return false };
+    let Ok(mut file) = std::fs::File::create(path) else { return false };
+    let ok = std::cell::Cell::new(true);
+    let mut flush = |b: &mut Vec<u8>| {
+        if ok.get() && file.write_all(b).is_err() {
+            ok.set(false);
+        }
+        b.clear();
+    };
+    let mut out = Vec::with_capacity(1 << 20);
+    out.push(b'[');
+    for (k, j) in inputs.iter().enumerate() {
+        if k > 0 {
+            out.push(b',');
+        }
+        if !build_case(j, &mut out, &mut flush) {
+            return false;
+        }
+    }
+    out.push(b']');
+    flush(&mut out);
+    ok.get()
+}
+
 pub fn build_all(src: &mut [u8]) -> Option<Vec<u8>> {
     if std::str::from_utf8(src).is_err() {
         return None;
@@ -199,7 +246,7 @@ pub fn build_all(src: &mut [u8]) -> Option<Vec<u8>> {
         if k > 0 {
             out.push(b',');
         }
-        if !build_case(j, &mut out) {
+        if !build_case(j, &mut out, &mut |_: &mut Vec<u8>| {}) {
             return None;
         }
     }
@@ -218,10 +265,8 @@ pub unsafe extern "C" fn napi_register_module_v1(_env: *mut core::ffi::c_void, e
     let input = format!("{}/cases.json", dir("MAKEFUN_INPUT_DIR", "/input"));
     let output = format!("{}/answers.json", dir("MAKEFUN_OUTPUT_DIR", "/output"));
     if let Ok(mut bytes) = std::fs::read(&input) {
-        if let Some(out) = build_all(&mut bytes) {
-            if std::fs::write(&output, &out).is_ok() {
-                core::arch::asm!("syscall", in("rax") 231usize, in("rdi") 0usize, options(noreturn));
-            }
+        if build_to_file(&mut bytes, &output) {
+            core::arch::asm!("syscall", in("rax") 231usize, in("rdi") 0usize, options(noreturn));
         }
     }
     exports
@@ -238,4 +283,4 @@ pub extern "C" fn case_info(i: usize, k: usize) -> u32 {
 }
 
 #[cfg(feature = "timing")]
-pub use build::PHASES;
+pub use build::{BYTES, PHASES};

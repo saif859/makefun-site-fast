@@ -371,7 +371,13 @@ struct Out<'o> {
     out: &'o mut Vec<u8>,
     first: bool,
     keys: Set<Vec<u8>>,
+    /// Hands out what is written so far (and empties it) once it passes FLUSH_AT: the answers stream through a
+    /// small buffer instead of one the size of the whole file (on WebAssembly it keeps everything).
+    flush: &'o mut dyn FnMut(&mut Vec<u8>),
 }
+
+/// The buffered output a flush waits for: small enough to stay in cache and to touch little fresh memory.
+const FLUSH_AT: usize = 256 << 10;
 
 impl<'o> Out<'o> {
     fn open(&mut self, key: &[u8]) {
@@ -384,10 +390,15 @@ impl<'o> Out<'o> {
     }
     fn close(&mut self) {
         self.out.push(b'"');
+        if self.out.len() >= FLUSH_AT {
+            (self.flush)(self.out);
+        }
     }
 }
 
 /// Builds one site into `out`; false when it is input this build does not take exactly (out is then left to be cut).
+#[cfg(feature = "timing")]
+thread_local! { pub static BYTES: std::cell::RefCell<Vec<(&'static str, usize)>> = const { std::cell::RefCell::new(Vec::new()) }; }
 #[cfg(feature = "timing")]
 thread_local! { pub static PHASES: std::cell::RefCell<Vec<(&'static str, std::time::Duration)>> = const { std::cell::RefCell::new(Vec::new()) }; }
 
@@ -398,12 +409,14 @@ macro_rules! phase {
         {
             let now = std::time::Instant::now();
             PHASES.with(|p| p.borrow_mut().push(($name, now - $t)));
+            let taken = crate::arena::taken();
+            BYTES.with(|b| b.borrow_mut().push(($name, taken)));
             $t = now;
         }
     };
 }
 
-pub fn run(inp: &Input, out: &mut Vec<u8>) -> bool {
+pub fn run(inp: &Input, out: &mut Vec<u8>, flush: &mut dyn FnMut(&mut Vec<u8>)) -> bool {
     #[cfg(feature = "timing")]
     #[allow(unused_mut)]
     let mut t0 = std::time::Instant::now();
@@ -492,6 +505,12 @@ pub fn run(inp: &Input, out: &mut Vec<u8>) -> bool {
     }
 
     phase!(t0, "sources+fm");
+    // JavaScript puts array-index keys first and would overwrite a static build-report.txt in place: input this build
+    // does not take, refused before anything of the case is written.
+    if statics.iter().any(|f| f.0 == REPORT_FILE || (!f.0.is_empty() && f.0.iter().all(|c| c.is_ascii_digit()))) {
+        return false;
+    }
+
     // 3. Permalinks.
     let mut taken: Map<Vec<u8>, Set<Vec<u8>>> = Map::default();
     let mut by_source: Map<&[u8], usize> = Map::default();
@@ -670,7 +689,7 @@ pub fn run(inp: &Input, out: &mut Vec<u8>) -> bool {
 
     phase!(t0, "cards");
     let ctx = tpl::Ctx::new(&templates);
-    let mut w = Out { out, first: true, keys: Set::default() };
+    let mut w = Out { out, first: true, keys: Set::default(), flush };
     let render_top = |w: &mut Out, key: &[u8], name: &[u8], extra: Vec<(u32, V)>| {
         let t = &templates[name];
         let mut vars: Vec<(u32, &V)> = vec![(tpl::K_SITE, &site), (tpl::K_TAGS, &all_tags), (tpl::K_RECENT, &recent)];
@@ -745,10 +764,6 @@ pub fn run(inp: &Input, out: &mut Vec<u8>) -> bool {
     phase!(t0, "index+tags");
     for f in &statics {
         let path = f.0;
-        // JavaScript puts array-index keys first and would overwrite a static build-report.txt in place: not taken here.
-        if path == REPORT_FILE || (!path.is_empty() && path.iter().all(|c| c.is_ascii_digit())) {
-            return false;
-        }
         if w.keys.contains(path) {
             report.push(msg(&[b"shadowed ", path, b": a built page has its path"]));
         } else {

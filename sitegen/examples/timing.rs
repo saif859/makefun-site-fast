@@ -10,6 +10,8 @@ fn main() {
         let before = sitegen::arena::taken();
         // Room first: a block taken during a case is given back after it (see the arena).
         sitegen::PHASES.with(|p| { p.borrow_mut().clear(); p.borrow_mut().reserve(1 << 16); });
+        sitegen::BYTES.with(|p| { p.borrow_mut().clear(); p.borrow_mut().reserve(1 << 16); });
+        let base = sitegen::arena::taken();
         let mut input = bytes.clone();
         let t = std::time::Instant::now();
         let out = sitegen::build_all(&mut input).expect("built");
@@ -21,6 +23,8 @@ fn main() {
         sitegen::PHASES.with(|p| for (n, d) in p.borrow().iter() { *sums.entry(n).or_default() += *d; });
         for (n, d) in sums { let e = best.entry(n).or_insert(d); if d < *e { *e = d; } }
     }
+    // Bytes taken by phase, in the last run (first case's).
+    sitegen::BYTES.with(|b| { let b = b.borrow(); let mut prev = 0usize; let start = b.first().map(|_| 0).unwrap_or(0); let _ = start; for (n, t) in b.iter().take(9) { println!("  bytes {:<12} {} KB", n, (t - prev.max(*t.min(&prev))) >> 10); prev = *t; } });
     println!("best total {:?} over {} runs; {} MB taken in all", best_total, runs, sitegen::arena::taken() >> 20);
     for (n, d) in best { println!("  {:<12} {:?}", n, d); }
 }

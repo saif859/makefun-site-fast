@@ -3,6 +3,7 @@
 // answers, one per case and in the cases' order. Outside a container MAKEFUN_INPUT_DIR and MAKEFUN_OUTPUT_DIR stand in
 // for /input and /output.
 
+import { isUtf8 } from 'node:buffer';
 import { closeSync, openSync, readFileSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
 import { setFlagsFromString } from 'node:v8';
@@ -10,22 +11,40 @@ import { setFlagsFromString } from 'node:v8';
 // V8's incremental marking off, set before solve.js is imported (as the house baseline does).
 setFlagsFromString('--no-incremental-marking');
 
-const { run } = (await import(new URL('./solve.js', import.meta.url).href)) as { run: (input: unknown) => unknown };
+type Run = (input: unknown) => unknown;
+const { run, runL1 } = (await import(new URL('./solve.js', import.meta.url).href)) as { run: Run; runL1: Run };
 
 const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
 const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
-const cases = JSON.parse(readFileSync(join(INPUT_DIR, 'cases.json'), 'utf8')) as ({ id: string; input: unknown } | null)[];
+const bytes = readFileSync(join(INPUT_DIR, 'cases.json'));
+
+/** Whether the JSON holds a \u escape of a non-ASCII character (an escaped backslash before a "u" counts too). */
+const escapesNonAscii = (b: Buffer): boolean => {
+  for (let at = b.indexOf('\\u'); at !== -1; at = b.indexOf('\\u', at + 2)) {
+    const hex = b.toString('latin1', at + 2, at + 6);
+    if (!/^00[0-7][0-9a-fA-F]$/.test(hex)) return true;
+  }
+  return false;
+};
+
+// One-byte mode (solve.js's runL1): the input read as Latin-1, so every string holds its UTF-8 one byte per char, and
+// the answers written as Latin-1, which is the UTF-8 the real strings give. It takes input that is valid UTF-8 with no
+// U+2028 or U+2029 and no \u escape of a non-ASCII character; anything else goes the ordinary way.
+const oneByte = isUtf8(bytes) && bytes.indexOf(' ') === -1 && bytes.indexOf(' ') === -1 && !escapesNonAscii(bytes);
+const ENC: BufferEncoding = oneByte ? 'latin1' : 'utf8';
+const solve: Run = oneByte ? runL1 : run;
+
+const cases = JSON.parse(bytes.toString(ENC)) as ({ id: string; input: unknown } | null)[];
 
 // The answers array is written one answer at a time, each as soon as it is built, so only one case's output is held
 // in memory at once (the file is the same JSON array JSON.stringify(answers) would give, value for value).
 const fd = openSync(join(OUTPUT_DIR, 'answers.json'), 'w');
 /** `text` written whole: as a string, then whatever a short write left, from its bytes. */
 const writeAll = (text: string): void => {
-  const done = writeSync(fd, text);
-  const bytes = Buffer.byteLength(text, 'utf8');
-  if (done === bytes) return;
-  const buf = Buffer.from(text, 'utf8');
+  const done = writeSync(fd, text, null, ENC);
+  if (done === (oneByte ? text.length : Buffer.byteLength(text, 'utf8'))) return;
+  const buf = Buffer.from(text, ENC);
   let off = done;
   while (off < buf.length) off += writeSync(fd, buf, off, buf.length - off);
 };
@@ -72,7 +91,7 @@ for (let k = 0; k < cases.length; k++) {
   const c = cases[k]!;
   cases[k] = null;
   put(k === 0 ? '[' : ',');
-  putAnswer(run(c.input));
+  putAnswer(solve(c.input));
 }
 put(cases.length === 0 ? '[]' : ']');
 if (size > 0) writeAll(pending.join(''));

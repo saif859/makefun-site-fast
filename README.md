@@ -5,7 +5,7 @@
 [![reward](https://make.fun/badge/site-generator-speed-01-run-20261122/saif859/makefun-site-fast/reward.svg)](https://make.fun/bounty/site-generator-speed-01-run-20261122?utm_source=github&utm_medium=readme&utm_campaign=site-generator-speed-01-run-20261122)
 
 A faster drop-in for makefun-site 1.0.0: `run(input)` in `solve.js` returns the same output tree, byte for byte
-(every page, the index and tag pages, `build-report.txt` and the static files), with roughly half the CPU time.
+(every page, the index and tag pages, `build-report.txt` and the static files), with well under half the CPU time.
 
 How it saves time, keeping every makefun-site rule:
 
@@ -14,9 +14,16 @@ How it saves time, keeping every makefun-site rule:
   or loop that reads one loop item alone (a post's card) is rendered once per item.
 - Inline Markdown runs on text escaped once up front (exact: entities hold none of the characters the inline rules
   look for), and lines are read by position instead of being split out.
+- The build runs on one-byte text: `main.ts` reads the input as Latin-1, so every string holds its UTF-8 one byte
+  per char (V8's compact one-byte strings, never two-byte ones), and writes the answers back as Latin-1, which is the
+  UTF-8 the real strings give. The few rules that look at what a non-ASCII character is (slugs' NFKD, JavaScript's
+  `\s` in word counts, trims and link targets, code-unit sort order, template parsing) read those bytes as UTF-8.
+  Input it cannot take exactly (invalid UTF-8, U+2028 or U+2029, a `\u` escape of a non-ASCII character) goes the
+  ordinary way.
 - `main.ts` writes each answer as soon as it is built, in small chunks, so no answer-sized string is ever held.
 
-Checked against makefun-site 1.0.0 on the kit's practice set and 120 more sites drawn with the kit's own generator:
+Checked against makefun-site 1.0.0 on the kit's practice set, 120 more sites drawn with the kit's own generator and
+sites with Unicode edge cases added (non-ASCII whitespace, characters above U+FFFF, odd tags, paths and templates):
 every output identical.
 
 ## Run it

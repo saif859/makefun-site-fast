@@ -41,7 +41,7 @@ function slugifyRaw(text) {
   let plain = text;
   for (let i = 0; i < text.length; i++) {
     if (text.charCodeAt(i) > 127) {
-      plain = text.normalize('NFKD').replace(MARKS, '');
+      plain = (L1 ? dec(text) : text).normalize('NFKD').replace(MARKS, '');
       break;
     }
   }
@@ -125,6 +125,118 @@ function trimLine(line) {
   return a === 0 && z === line.length ? line : line.slice(a, z);
 }
 
+// ---------------------------------------------------------------- one-byte text
+//
+// runL1(input) builds from one-byte text: every string holds the UTF-8 of the real one, one byte per char (a Latin-1
+// reading of UTF-8), so its output, written out as Latin-1, is the UTF-8 the real build writes. Every rule works on
+// it unchanged except those that look at what a non-ASCII character is; those read L1 and take the bytes as UTF-8:
+// slugs (NFKD), JavaScript's \s (word counts, trims, link targets, list continuation lines), code-unit order (sorts)
+// and template parsing. main.ts uses it only for input that is valid UTF-8 with no U+2028 or U+2029 (which a regex
+// "." stops at) and no \u escape of a non-ASCII character.
+
+let L1 = false;
+/** One-byte text's real string. */
+const dec = (s) => Buffer.from(s, 'latin1').toString('utf8');
+/** A real string's one-byte text. */
+const enc = (s) => Buffer.from(s, 'utf8').toString('latin1');
+
+/**
+ * In one-byte text s, the byte length of the JavaScript \s character whose UTF-8 starts at i with byte c (>= 0x80),
+ * or 0: U+00A0, U+1680, U+2000-U+200A, U+2028, U+2029, U+202F, U+205F, U+3000 and U+FEFF.
+ */
+function wsAt(s, i, c) {
+  if (c === 0xc2) return s.charCodeAt(i + 1) === 0xa0 ? 2 : 0;
+  if (c === 0xe2) {
+    const d = s.charCodeAt(i + 1);
+    const e = s.charCodeAt(i + 2);
+    if (d === 0x80) return (e >= 0x80 && e <= 0x8a) || e === 0xa8 || e === 0xa9 || e === 0xaf ? 3 : 0;
+    return d === 0x81 && e === 0x9f ? 3 : 0;
+  }
+  if (c === 0xe1) return s.charCodeAt(i + 1) === 0x9a && s.charCodeAt(i + 2) === 0x80 ? 3 : 0;
+  if (c === 0xe3) return s.charCodeAt(i + 1) === 0x80 && s.charCodeAt(i + 2) === 0x80 ? 3 : 0;
+  if (c === 0xef) return s.charCodeAt(i + 1) === 0xbb && s.charCodeAt(i + 2) === 0xbf ? 3 : 0;
+  return 0;
+}
+
+/** String.prototype.trim of one-byte text (its \s and line terminators dropped at either end). */
+function trimL1(s) {
+  let a = 0;
+  let z = s.length;
+  while (a < z) {
+    const c = s.charCodeAt(a);
+    if (c === 32 || (c >= 9 && c <= 13)) a++;
+    else if (c >= 0xc2) {
+      const w = wsAt(s, a, c);
+      if (w === 0) break;
+      a += w;
+    } else break;
+  }
+  while (z > a) {
+    const c = s.charCodeAt(z - 1);
+    if (c === 32 || (c >= 9 && c <= 13)) z--;
+    else if (c === 0xa0 && z - 2 >= a && s.charCodeAt(z - 2) === 0xc2) z -= 2;
+    else if (c >= 0x80 && z - 3 >= a && wsAt(s, z - 3, s.charCodeAt(z - 3)) === 3) z -= 3;
+    else break;
+  }
+  return a === 0 && z === s.length ? s : s.slice(a, z);
+}
+
+const trimU = (s) => (L1 ? trimL1(s) : s.trim());
+
+/** Whether one-byte text holds a JavaScript \s character. */
+function hasSpaceL1(s) {
+  const n = s.length;
+  for (let i = 0; i < n; i++) {
+    const c = s.charCodeAt(i);
+    if (c === 32 || (c >= 9 && c <= 13)) return true;
+    if (c >= 0xc2 && wsAt(s, i, c) !== 0) return true;
+  }
+  return false;
+}
+
+/** The count of /\S+/g matches in one-byte text. */
+function wordsOfL1(text) {
+  let count = 0;
+  let inWord = false;
+  const n = text.length;
+  for (let i = 0; i < n; i++) {
+    const c = text.charCodeAt(i);
+    if (c > 32 && c < 0xc2) {
+      if (!inWord) {
+        inWord = true;
+        count++;
+      }
+    } else if (c <= 32 ? c === 32 || (c >= 9 && c <= 13) : wsAt(text, i, c) !== 0) {
+      inWord = false;
+      if (c > 32) i += wsAt(text, i, c) - 1;
+    } else if (!inWord) {
+      inWord = true;
+      count++;
+    }
+  }
+  return count;
+}
+
+/** /^ {2,}\S/ on one-byte text. */
+function continuedL1(line) {
+  let k = 0;
+  while (line.charCodeAt(k) === 32) k++;
+  if (k < 2 || k >= line.length) return false;
+  const c = line.charCodeAt(k);
+  if (c < 0x80) return !(c >= 9 && c <= 13);
+  return c < 0xc2 || wsAt(line, k, c) === 0;
+}
+
+/** Whether one-byte strings a < b (as bytes) order the other way as UTF-16 code units: U+E000-U+FFFF against U+10000 up. */
+function l1Inverted(a, b) {
+  const n = Math.min(a.length, b.length);
+  let i = 0;
+  while (i < n && a.charCodeAt(i) === b.charCodeAt(i)) i++;
+  if (i === n) return false;
+  const x = a.charCodeAt(i);
+  return (x === 0xee || x === 0xef) && b.charCodeAt(i) >= 0xf0;
+}
+
 /** Whether a line is only spaces and tabs. */
 function isBlank(line) {
   for (let i = 0; i < line.length; i++) {
@@ -186,8 +298,8 @@ function valueOf(key, raw) {
     case 'tags': {
       if (!raw.startsWith('[') || !raw.endsWith(']')) return { error: 'key "tags": not a list [a, b]' };
       const inner = raw.slice(1, -1);
-      if (inner.trim() === '') return { value: [] };
-      const tags = inner.split(',').map((t) => t.trim());
+      if (trimU(inner) === '') return { value: [] };
+      const tags = inner.split(',').map(trimU);
       if (tags.some((t) => t === '' || !TAG.test(t))) return { error: 'key "tags": an empty tag, or one holding " [ or ]' };
       return { value: tags };
     }
@@ -395,7 +507,7 @@ function inline(s, link) {
       const m = k !== -1 && s.charCodeAt(k + 1) === 40 ? s.indexOf(')', k + 2) : -1;
       if (m !== -1 && m > k + 2) {
         const target = s.slice(k + 2, m);
-        if (!SPACE_RE.test(target)) {
+        if (!(L1 ? hasSpaceL1(target) : SPACE_RE.test(target))) {
           const raw = unesc(target);
           const href = link(raw);
           if (i > run) out += s.slice(run, i);
@@ -535,7 +647,7 @@ function renderMarkdown(src, link) {
             if (cur !== null) parts.push('<li>', inline(esc(cur), link), '</li>\n');
             cur = trimLine(isOrdered ? m[2] : m[1]);
             i++;
-          } else if (CONTINUED.test(ln)) {
+          } else if (L1 ? continuedL1(ln) : CONTINUED.test(ln)) {
             cur += `\n${trimLine(ln)}`;
             i++;
           } else break;
@@ -946,7 +1058,30 @@ function renderNodes(nodes, scope, templates, depth) {
 
 // ---------------------------------------------------------------- the build
 
-const byCodeUnits = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+const byCodeUnits = (a, b) => (a < b ? (L1 && l1Inverted(a, b) ? 1 : -1) : a > b ? (L1 && l1Inverted(b, a) ? -1 : 1) : 0);
+
+/** parseTemplate on one-byte text: parsed as the real text (its trims are \s ones), its text and errors one-byte again. */
+function parseTemplateL1(name, src) {
+  let nodes;
+  try {
+    nodes = parseTemplate(dec(name), dec(src));
+  } catch (err) {
+    if (err instanceof TemplateError) throw new TemplateError(enc(err.message));
+    throw err;
+  }
+  const fix = (list) => {
+    for (const n of list) {
+      if (n.kind === 'text') n.text = enc(n.text);
+      else if (n.kind === 'for') fix(n.body);
+      else if (n.kind === 'if') {
+        fix(n.then);
+        if (n.else !== null) fix(n.else);
+      }
+    }
+  };
+  fix(nodes);
+  return nodes;
+}
 
 /**
  * `rel` from directory `dir`, or null when it climbs out of the root: leading "../" steps taken off `dir`, then the
@@ -1005,7 +1140,7 @@ export function run(input) {
   const report = [];
   for (const name of Object.keys(input.templates).sort(byCodeUnits)) {
     try {
-      templates.set(name, parseTemplate(name, input.templates[name]));
+      templates.set(name, L1 ? parseTemplateL1(name, input.templates[name]) : parseTemplate(name, input.templates[name]));
     } catch (err) {
       if (!(err instanceof TemplateError)) throw err;
       report.push(err.message);
@@ -1153,7 +1288,7 @@ export function run(input) {
     date_long: s.data.date === undefined ? '' : longDate(s.data.date),
     summary: s.data.summary ?? '',
     excerpt: s.excerpt,
-    reading_minutes: Math.max(1, Math.ceil(wordsOf(s.body) / 200)),
+    reading_minutes: Math.max(1, Math.ceil((L1 ? wordsOfL1(s.body) : wordsOf(s.body)) / 200)),
     tags: s.tagRefs.map((t) => ({ name: t.name, slug: t.slug, url: t.url })),
   });
   const linkOf = (s) => (s === null ? null : { title: s.data.title, url: s.url, date: s.data.date ?? '', date_long: s.data.date === undefined ? '' : longDate(s.data.date) });
@@ -1194,7 +1329,7 @@ export function run(input) {
   const output = {};
   for (const s of sources) {
     const page = {
-      ...cardOf(s),
+      ...(s.post ? cards.get(s) : cardOf(s)),
       slug: s.slug,
       content: s.html,
       toc: s.toc.map((h) => ({ level: h.level, id: h.id, html: h.html })),
@@ -1229,10 +1364,20 @@ export function run(input) {
   }
 
   // 8. The report.
-  const lines = report.concat([...broken]).sort();
+  const lines = report.concat([...broken]).sort(byCodeUnits);
   let nPages = 0;
   for (const s of sources) if (!s.post) nPages++;
   lines.push(`built ${nPages} pages, ${posts.length} posts, ${tagList.length} tags and ${statics.length} static files`);
   output[REPORT_FILE] = `${lines.join('\n')}\n`;
   return output;
+}
+
+/** run on one-byte text (see "one-byte text" above): the same tree as one-byte text. */
+export function runL1(input) {
+  L1 = true;
+  try {
+    return run(input);
+  } finally {
+    L1 = false;
+  }
 }

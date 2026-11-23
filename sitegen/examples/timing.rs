@@ -9,12 +9,13 @@ fn main() {
     for _ in 0..runs {
         let before = sitegen::arena::taken();
         // Room first: a block taken during a case is given back after it (see the arena).
-        sitegen::PHASES.with(|p| { p.borrow_mut().clear(); p.borrow_mut().reserve(1 << 16); });
-        sitegen::BYTES.with(|p| { p.borrow_mut().clear(); p.borrow_mut().reserve(1 << 16); });
+        sitegen::PHASES.with(|p| { p.borrow_mut().clear(); p.borrow_mut().reserve(1 << 10); });
+        sitegen::BYTES.with(|p| { p.borrow_mut().clear(); p.borrow_mut().reserve(1 << 10); });
         let base = sitegen::arena::taken();
         let mut input = bytes.clone();
         let t = std::time::Instant::now();
-        let out = sitegen::build_all(&mut input).expect("built");
+        let out = sitegen::build_to_file(&mut input, "C:/Users/SAFIUD~1/AppData/Local/Temp/claude/a479ac777d22ffec/7cea6c6b-5f06-47bb-a4c2-f69219ad7cc1/scratchpad/timing-answers.json");
+        assert!(out, "built");
         let total = t.elapsed();
         std::hint::black_box(out);
         if best_total == std::time::Duration::MAX { eprintln!("one run takes {} MB", (sitegen::arena::taken() - before) >> 20); }
@@ -25,6 +26,7 @@ fn main() {
     }
     // Bytes taken by phase, in the last run (first case's).
     sitegen::BYTES.with(|b| { let b = b.borrow(); let mut prev = 0usize; let start = b.first().map(|_| 0).unwrap_or(0); let _ = start; for (n, t) in b.iter().take(9) { println!("  bytes {:<12} {} KB", n, (t - prev.max(*t.min(&prev))) >> 10); prev = *t; } });
+    println!("arena peak (first chunk) {} KB", sitegen::arena::peak() >> 10);
     println!("best total {:?} over {} runs; {} MB taken in all", best_total, runs, sitegen::arena::taken() >> 20);
     for (n, d) in best { println!("  {:<12} {:?}", n, d); }
 }

@@ -21,6 +21,14 @@ pub mod arena {
     #[cfg(feature = "timing")]
     thread_local! { pub static TAKEN: Cell<usize> = const { Cell::new(0) }; }
     #[cfg(feature = "timing")]
+    thread_local! { pub static PEAK: Cell<usize> = const { Cell::new(0) }; }
+    #[cfg(feature = "timing")]
+    thread_local! { pub static CHUNK0: Cell<usize> = const { Cell::new(0) }; }
+    #[cfg(feature = "timing")]
+    pub fn peak() -> usize {
+        PEAK.with(|p| p.get())
+    }
+    #[cfg(feature = "timing")]
     pub fn taken() -> usize {
         TAKEN.with(|t| t.get())
     }
@@ -68,6 +76,7 @@ pub mod arena {
             #[cfg(feature = "timing")]
             {
                 TAKEN.with(|t| t.set(t.get() + size));
+                PEAK.with(|p| p.set(p.get().max(self.next.get().wrapping_sub(CHUNK0.with(|c| c.get())).min(1 << 40))));
             }
             let a = (self.next.get() + align - 1) & !(align - 1);
             if self.next.get() != 0 && a + size <= self.end.get() {
@@ -75,6 +84,8 @@ pub mod arena {
                 return a as *mut u8;
             }
             let Some((start, end)) = more(size + align) else { return core::ptr::null_mut() };
+            #[cfg(feature = "timing")]
+            CHUNK0.with(|c| if c.get() == 0 { c.set(start) });
             // Memory that carries on from the chunk in use extends it; any other is a new chunk.
             if start != self.end.get() || self.next.get() == 0 {
                 self.next.set(start);

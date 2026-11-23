@@ -513,8 +513,9 @@ fn free_of(nodes: &[Node], inc: &Map<Vec<u8>, Vec<u32>>, out: &mut Vec<u32>) {
     }
 }
 
-/// The include and for nodes whose output reads nothing but the build-wide names (site, tags, recent): by address.
-pub fn constants(tpls: &Map<Vec<u8>, Vec<Node>>) -> Set<usize> {
+/// The include and for nodes whose output reads nothing but the build-wide names (site, tags, recent), by address;
+/// and the include nodes whose template reads those and one name more (not loop): that name, by the node's address.
+pub fn constants(tpls: &Map<Vec<u8>, Vec<Node>>) -> (Set<usize>, Map<usize, u32>) {
     let mut free: Map<Vec<u8>, Vec<u32>> = tpls.keys().map(|k| (k.clone(), Vec::new())).collect();
     loop {
         let mut changed = false;
@@ -533,13 +534,14 @@ pub fn constants(tpls: &Map<Vec<u8>, Vec<Node>>) -> Set<usize> {
         }
     }
     let mut out = Set::default();
-    fn visit(nodes: &[Node], free: &Map<Vec<u8>, Vec<u32>>, out: &mut Set<usize>) {
+    let mut item = Map::default();
+    fn visit(nodes: &[Node], free: &Map<Vec<u8>, Vec<u32>>, out: &mut Set<usize>, item: &mut Map<usize, u32>) {
         for n in nodes {
             match n {
                 Node::If(_, _, then, els) => {
-                    visit(then, free, out);
+                    visit(then, free, out, item);
                     if let Some(e) = els {
-                        visit(e, free, out);
+                        visit(e, free, out, item);
                     }
                 }
                 Node::For(_, _, body) => {
@@ -548,11 +550,16 @@ pub fn constants(tpls: &Map<Vec<u8>, Vec<Node>>) -> Set<usize> {
                     if f.iter().all(|k| GLOBALS.contains(k)) {
                         out.insert(n as *const Node as usize);
                     }
-                    visit(body, free, out);
+                    visit(body, free, out, item);
                 }
                 Node::Include(t) => {
-                    if free.get(t).is_some_and(|f| f.iter().all(|k| GLOBALS.contains(k))) {
-                        out.insert(n as *const Node as usize);
+                    if let Some(f) = free.get(t) {
+                        let other: Vec<u32> = f.iter().copied().filter(|k| !GLOBALS.contains(k)).collect();
+                        if other.is_empty() {
+                            out.insert(n as *const Node as usize);
+                        } else if other.len() == 1 && other[0] != K_LOOP {
+                            item.insert(n as *const Node as usize, other[0]);
+                        }
                     }
                 }
                 _ => {}
@@ -560,9 +567,9 @@ pub fn constants(tpls: &Map<Vec<u8>, Vec<Node>>) -> Set<usize> {
         }
     }
     for nodes in tpls.values() {
-        visit(nodes, &free, &mut out);
+        visit(nodes, &free, &mut out, &mut item);
     }
-    out
+    (out, item)
 }
 
 /// What a build's renders share: its templates, the nodes whose output is the same in every render (at one include
@@ -570,14 +577,30 @@ pub fn constants(tpls: &Map<Vec<u8>, Vec<Node>>) -> Set<usize> {
 pub struct Ctx<'t> {
     pub tpls: &'t Map<Vec<u8>, Vec<Node>>,
     pub constant: Set<usize>,
-    cache: std::cell::RefCell<Map<(usize, usize), (usize, usize)>>,
+    /// Include nodes whose output is fixed by one name's object (a card's post): that name.
+    item: Map<usize, u32>,
+    /// Output once made, by (node or template, include depth, object or 0).
+    cache: std::cell::RefCell<Map<(usize, usize, usize), (usize, usize)>>,
     buf: std::cell::RefCell<Vec<u8>>,
 }
 
 impl<'t> Ctx<'t> {
     pub fn new(tpls: &'t Map<Vec<u8>, Vec<Node>>) -> Ctx<'t> {
-        Ctx { tpls, constant: constants(tpls), cache: Default::default(), buf: Default::default() }
+        let (constant, item) = constants(tpls);
+        Ctx { tpls, constant, item, cache: Default::default(), buf: Default::default() }
     }
+}
+
+/// Whether name y resolves to a loop's binding (a frame below the render's own top one).
+fn loop_bound(f: &Frame, y: u32) -> bool {
+    let mut cur = Some(f);
+    while let Some(fr) = cur {
+        if fr.vars.iter().any(|(k, _)| *k == y) {
+            return fr.parent.is_some();
+        }
+        cur = fr.parent;
+    }
+    false
 }
 
 /// Whether a frame below the render's own top one binds a build-wide name (a loop variable named site, say).
@@ -602,7 +625,12 @@ fn cached(n: &Node, f: &Frame, ctx: &Ctx, depth: usize, out: &mut Vec<u8>, make:
         make(out);
         return;
     }
-    if let Some(&(a, b)) = ctx.cache.borrow().get(&(at, depth)) {
+    keyed((at, depth, 0), ctx, out, make);
+}
+
+/// The output `make` writes, from the cache under `key` when it was made before.
+fn keyed(key: (usize, usize, usize), ctx: &Ctx, out: &mut Vec<u8>, make: impl FnOnce(&mut Vec<u8>)) {
+    if let Some(&(a, b)) = ctx.cache.borrow().get(&key) {
         out.put(&ctx.buf.borrow()[a..b]);
         return;
     }
@@ -612,7 +640,7 @@ fn cached(n: &Node, f: &Frame, ctx: &Ctx, depth: usize, out: &mut Vec<u8>, make:
     let a = buf.len();
     buf.extend_from_slice(&out[start..]);
     let b = buf.len();
-    ctx.cache.borrow_mut().insert((at, depth), (a, b));
+    ctx.cache.borrow_mut().insert(key, (a, b));
 }
 
 pub fn render(nodes: &[Node], f: &Frame, ctx: &Ctx, depth: usize, out: &mut Vec<u8>) {
@@ -650,6 +678,19 @@ pub fn render(nodes: &[Node], f: &Frame, ctx: &Ctx, depth: usize, out: &mut Vec<
             Node::Include(name) => {
                 if depth < INCLUDE_DEPTH {
                     if let Some(t) = ctx.tpls.get(name) {
+                        // A template that reads one name besides the build-wide ones (a card, its post) renders the
+                        // same for the same object: once per object, template and depth.
+                        if let Some(&y) = ctx.item.get(&(n as *const Node as usize)) {
+                            // Only for a name a loop binds (its items come round again); a render's own top-level
+                            // name (the page) is met once.
+                            if loop_bound(f, y) && !shadowed(f) {
+                                if let Got::Ref(V::Obj(o)) = lookup(f, &[y]) {
+                                    let key = (t.as_ptr() as usize, depth, Rc::as_ptr(o) as usize);
+                                    keyed(key, ctx, out, |out| render(t, f, ctx, depth + 1, out));
+                                    continue;
+                                }
+                            }
+                        }
                         cached(n, f, ctx, depth, out, |out| render(t, f, ctx, depth + 1, out));
                     }
                 }

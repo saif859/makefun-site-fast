@@ -70,16 +70,67 @@ const fn class_table() -> [u8; 256] {
 }
 pub const CLASS: [u8; 256] = class_table();
 
+const LO: u64 = 0x0101_0101_0101_0101;
+const HI: u64 = 0x8080_8080_8080_8080;
+
+/// A high bit in every byte of w that is c (and maybe in bytes after one: never none when there is one).
+#[inline(always)]
+fn bytes_eq(w: u64, c: u8) -> u64 {
+    let x = w ^ (LO * c as u64);
+    x.wrapping_sub(LO) & !x & HI
+}
+
+/// The first index from i of a byte in `set` (or below 0x20, with `ctl`), or s.len(): eight bytes at a time while
+/// none is there, then byte by byte on CLASS bit `bit`, which marks the same bytes.
+#[inline(always)]
+pub fn scan<const N: usize>(s: &[u8], mut i: usize, set: [u8; N], ctl: bool, bit: u8) -> usize {
+    while i + 8 <= s.len() {
+        let w = u64::from_le_bytes(s[i..i + 8].try_into().unwrap());
+        let mut m = if ctl { w.wrapping_sub(LO * 0x20) & !w & HI } else { 0 };
+        for c in set {
+            m |= bytes_eq(w, c);
+        }
+        if m != 0 {
+            break;
+        }
+        i += 8;
+    }
+    while i < s.len() && CLASS[s[i] as usize] & bit == 0 {
+        i += 1;
+    }
+    i
+}
+
+#[inline(always)]
+fn next_html(s: &[u8], i: usize) -> usize {
+    scan(s, i, [b'&', b'<', b'>', b'"', b'\''], false, 1)
+}
+
+#[inline(always)]
+pub fn next_json(s: &[u8], i: usize) -> usize {
+    scan(s, i, [b'"', b'\\'], true, 2)
+}
+
+#[inline(always)]
+fn next_html_json(s: &[u8], i: usize) -> usize {
+    scan(s, i, [b'&', b'<', b'>', b'"', b'\'', b'\\'], true, 3)
+}
+
+/// The next byte inline Markdown acts on or escaping changes (& < > " ' \ ` * [).
+#[inline(always)]
+pub fn next_inline(s: &[u8], i: usize) -> usize {
+    scan(s, i, [b'&', b'<', b'>', b'"', b'\'', b'\\', b'`', b'*', b'['], false, 4)
+}
+
 /// s with & < > " and ' escaped, appended to out.
 pub fn esc_into(out: &mut Vec<u8>, s: &[u8]) {
     let mut run = 0;
-    for (i, &c) in s.iter().enumerate() {
-        if CLASS[c as usize] & 1 == 0 {
-            continue;
-        }
+    let mut i = next_html(s, 0);
+    while i < s.len() {
         out.extend_from_slice(&s[run..i]);
-        out.extend_from_slice(entity(c).unwrap());
+        out.extend_from_slice(entity(s[i]).unwrap());
         run = i + 1;
+        i = next_html(s, i + 1);
     }
     out.extend_from_slice(&s[run..]);
 }
@@ -107,13 +158,12 @@ fn json_escape(out: &mut Vec<u8>, c: u8) {
 pub fn json_into(out: &mut Vec<u8>, s: &[u8]) {
     out.reserve(s.len());
     let mut run = 0;
-    for (i, &c) in s.iter().enumerate() {
-        if CLASS[c as usize] & 2 == 0 {
-            continue;
-        }
+    let mut i = next_json(s, 0);
+    while i < s.len() {
         out.extend_from_slice(&s[run..i]);
-        json_escape(out, c);
+        json_escape(out, s[i]);
         run = i + 1;
+        i = next_json(s, i + 1);
     }
     out.extend_from_slice(&s[run..]);
 }
@@ -122,18 +172,17 @@ pub fn json_into(out: &mut Vec<u8>, s: &[u8]) {
 pub fn html_json_into(out: &mut Vec<u8>, s: &[u8]) {
     out.reserve(s.len());
     let mut run = 0;
-    for (i, &c) in s.iter().enumerate() {
-        let k = CLASS[c as usize];
-        if k & 3 == 0 {
-            continue;
-        }
+    let mut i = next_html_json(s, 0);
+    while i < s.len() {
+        let c = s[i];
         out.extend_from_slice(&s[run..i]);
-        if k & 1 != 0 {
+        if CLASS[c as usize] & 1 != 0 {
             out.extend_from_slice(entity(c).unwrap());
         } else {
             json_escape(out, c);
         }
         run = i + 1;
+        i = next_html_json(s, i + 1);
     }
     out.extend_from_slice(&s[run..]);
 }
@@ -267,31 +316,58 @@ pub fn all_st(s: &[u8]) -> bool {
     s.iter().all(|&c| is_st(c))
 }
 
-/// The count of /\S+/g matches.
+/// A high bit in exactly the bytes of w that are c.
+#[inline(always)]
+fn eq_exact(w: u64, c: u8) -> u64 {
+    let x = w ^ (LO * c as u64);
+    !(((x & !HI).wrapping_add(!HI)) | x | !HI)
+}
+
+/// A high bit in exactly the bytes of w below c (c <= 0x80).
+#[inline(always)]
+fn lt_exact(w: u64, c: u8) -> u64 {
+    !(((w & !HI).wrapping_add(LO * (0x80 - c as u64))) | w) & HI
+}
+
+/// The count of /\S+/g matches: eight bytes at a time (ASCII whitespace by mask, word starts by popcount) where no
+/// byte can start a non-ASCII \s character, byte by byte elsewhere.
 pub fn words(s: &[u8]) -> usize {
     let mut n = 0;
     let mut in_word = false;
     let mut i = 0;
     while i < s.len() {
-        let c = s[i];
-        if c > 32 && c < 0xc2 {
-            if !in_word {
-                in_word = true;
-                n += 1;
+        let mut end = s.len();
+        if i + 8 <= s.len() {
+            let w = u64::from_le_bytes(s[i..i + 8].try_into().unwrap());
+            let lead = bytes_eq(w, 0xc2) | bytes_eq(w, 0xe1) | bytes_eq(w, 0xe2) | bytes_eq(w, 0xe3) | bytes_eq(w, 0xef);
+            if lead == 0 {
+                let space = eq_exact(w, b' ') | (lt_exact(w, 14) & !lt_exact(w, 9));
+                let prev_space = (space << 8) | if in_word { 0 } else { 0x80 };
+                n += (!space & HI & prev_space).count_ones() as usize;
+                in_word = space >> 63 == 0;
+                i += 8;
+                continue;
             }
-            i += 1;
-            continue;
+            end = i + 8;
         }
-        let w = ws_at(s, i);
-        if w > 0 {
-            in_word = false;
-            i += w;
-        } else {
-            if !in_word {
-                in_word = true;
-                n += 1;
+        while i < end {
+            let c = s[i];
+            if c == b' ' || (9..=13).contains(&c) {
+                in_word = false;
+                i += 1;
+                continue;
             }
-            i += 1;
+            let ws = if c >= 0xc2 { ws_at(s, i) } else { 0 };
+            if ws > 0 {
+                in_word = false;
+                i += ws;
+            } else {
+                if !in_word {
+                    in_word = true;
+                    n += 1;
+                }
+                i += 1;
+            }
         }
     }
     n

@@ -1,19 +1,21 @@
 //! A JSON reader for cases.json. Strings come out as their UTF-8 bytes; a \u escape is taken only below U+0080
 //! (main.ts sends any other input the JavaScript way), and anything this build does not read gives None.
 
-pub enum J {
+use std::borrow::Cow;
+
+pub enum J<'a> {
     Null,
     #[allow(dead_code)]
     Bool(bool),
     Num(f64),
-    Str(Vec<u8>),
-    Arr(Vec<J>),
-    Obj(Vec<(Vec<u8>, J)>),
+    Str(Cow<'a, [u8]>),
+    Arr(Vec<J<'a>>),
+    Obj(Vec<(&'a [u8], J<'a>)>),
 }
 
-impl J {
+impl<'a> J<'a> {
     /// An object's member (the last one given, as JSON.parse keeps it).
-    pub fn get(&self, k: &[u8]) -> Option<&J> {
+    pub fn get(&self, k: &[u8]) -> Option<&J<'a>> {
         match self {
             J::Obj(v) => v.iter().find(|e| e.0 == k).map(|e| &e.1),
             _ => None,
@@ -22,7 +24,7 @@ impl J {
 
     pub fn str(&self) -> Option<&[u8]> {
         match self {
-            J::Str(s) => Some(s),
+            J::Str(s) => Some(&s[..]),
             _ => None,
         }
     }
@@ -48,7 +50,7 @@ impl<'a> P<'a> {
         self.s.get(self.i).copied()
     }
 
-    fn lit(&mut self, w: &[u8], v: J) -> Option<J> {
+    fn lit(&mut self, w: &[u8], v: J<'a>) -> Option<J<'a>> {
         if self.s[self.i..].starts_with(w) {
             self.i += w.len();
             Some(v)
@@ -57,7 +59,7 @@ impl<'a> P<'a> {
         }
     }
 
-    fn value(&mut self, depth: u32) -> Option<J> {
+    fn value(&mut self, depth: u32) -> Option<J<'a>> {
         if depth > 512 {
             return None;
         }
@@ -65,7 +67,7 @@ impl<'a> P<'a> {
         match self.peek()? {
             b'{' => {
                 self.i += 1;
-                let mut v: Vec<(Vec<u8>, J)> = Vec::new();
+                let mut v: Vec<(&'a [u8], J<'a>)> = Vec::new();
                 self.ws();
                 if self.peek() == Some(b'}') {
                     self.i += 1;
@@ -76,7 +78,11 @@ impl<'a> P<'a> {
                     if self.peek()? != b'"' {
                         return None;
                     }
-                    let k = self.string()?;
+                    // Keys are taken as they are written: one holding an escape is not this build's input.
+                    let k = match self.string()? {
+                        Cow::Borrowed(k) => k,
+                        Cow::Owned(_) => return None,
+                    };
                     self.ws();
                     if self.peek()? != b':' {
                         return None;
@@ -127,34 +133,25 @@ impl<'a> P<'a> {
         }
     }
 
-    fn string(&mut self) -> Option<Vec<u8>> {
+    fn string(&mut self) -> Option<Cow<'a, [u8]>> {
         let s = self.s;
         let start = self.i + 1;
-        let mut j = start;
-        while j < s.len() {
-            let c = s[j];
-            if c == b'"' {
-                self.i = j + 1;
-                return Some(s[start..j].to_vec());
-            }
-            if c == b'\\' || c < 0x20 {
-                break;
-            }
-            j += 1;
+        let mut j = crate::text::next_json(s, start);
+        if j < s.len() && s[j] == b'"' {
+            self.i = j + 1;
+            return Some(Cow::Borrowed(&s[start..j]));
         }
         let mut out = Vec::with_capacity(j - start + 64);
         out.extend_from_slice(&s[start..j.min(s.len())]);
         loop {
             // A run up to the next quote, backslash or control character, copied whole.
             let from = j;
-            while j < s.len() && s[j] != b'"' && s[j] != b'\\' && s[j] >= 0x20 {
-                j += 1;
-            }
+            j = crate::text::next_json(s, j);
             out.extend_from_slice(&s[from..j]);
             let c = *s.get(j)?;
             if c == b'"' {
                 self.i = j + 1;
-                return Some(out);
+                return Some(Cow::Owned(out));
             }
             if c < 0x20 {
                 return None;
@@ -187,7 +184,7 @@ impl<'a> P<'a> {
         }
     }
 
-    fn number(&mut self) -> Option<J> {
+    fn number(&mut self) -> Option<J<'a>> {
         let s = self.s;
         let start = self.i;
         let mut j = start;
@@ -204,7 +201,7 @@ impl<'a> P<'a> {
 }
 
 /// The input of every case in cases.json (a JSON array of {id, input}), or None.
-pub fn parse_cases(src: &[u8]) -> Option<Vec<J>> {
+pub fn parse_cases(src: &[u8]) -> Option<Vec<J<'_>>> {
     let mut p = P { s: src, i: 0 };
     let v = p.value(0)?;
     p.ws();

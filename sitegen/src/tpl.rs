@@ -4,15 +4,76 @@
 
 use crate::text::*;
 
+use std::cell::OnceCell;
 use std::rc::Rc;
+
+// Every name a template reads is an interned id: the names the build's values use are fixed ones, the rest (loop
+// variables, names no value has) get theirs as they are met.
+pub const K_SITE: u32 = 0;
+pub const K_TAGS: u32 = 1;
+pub const K_RECENT: u32 = 2;
+pub const K_PAGE: u32 = 3;
+pub const K_POSTS: u32 = 4;
+pub const K_PAGER: u32 = 5;
+pub const K_TAG: u32 = 6;
+pub const K_LOOP: u32 = 7;
+pub const K_TITLE: u32 = 8;
+pub const K_URL: u32 = 9;
+pub const K_DATE: u32 = 10;
+pub const K_DATE_LONG: u32 = 11;
+pub const K_SUMMARY: u32 = 12;
+pub const K_EXCERPT: u32 = 13;
+pub const K_READING_MINUTES: u32 = 14;
+pub const K_SLUG: u32 = 15;
+pub const K_CONTENT: u32 = 16;
+pub const K_TOC: u32 = 17;
+pub const K_NEWER: u32 = 18;
+pub const K_OLDER: u32 = 19;
+pub const K_IS_POST: u32 = 20;
+pub const K_NAME: u32 = 21;
+pub const K_COUNT: u32 = 22;
+pub const K_LEVEL: u32 = 23;
+pub const K_ID: u32 = 24;
+pub const K_HTML: u32 = 25;
+pub const K_NUMBER: u32 = 26;
+pub const K_TOTAL: u32 = 27;
+pub const K_NEWER_URL: u32 = 28;
+pub const K_OLDER_URL: u32 = 29;
+pub const K_BASE_URL: u32 = 30;
+pub const K_INDEX: u32 = 31;
+pub const K_FIRST: u32 = 32;
+pub const K_LAST: u32 = 33;
+pub const K_LENGTH: u32 = 34;
+const KNOWN: [&[u8]; 35] = [b"site", b"tags", b"recent", b"page", b"posts", b"pager", b"tag", b"loop", b"title", b"url", b"date", b"date_long", b"summary", b"excerpt", b"reading_minutes", b"slug", b"content", b"toc", b"newer", b"older", b"is_post", b"name", b"count", b"level", b"id", b"html", b"number", b"total", b"newer_url", b"older_url", b"base_url", b"index", b"first", b"last", b"length"];
+
+pub struct Keys(Map<Vec<u8>, u32>);
+
+impl Keys {
+    pub fn new() -> Keys {
+        let mut m = Map::default();
+        for (i, k) in KNOWN.iter().enumerate() {
+            m.insert(k.to_vec(), i as u32);
+        }
+        Keys(m)
+    }
+
+    pub fn id(&mut self, k: &[u8]) -> u32 {
+        if let Some(&i) = self.0.get(k) {
+            return i;
+        }
+        let i = self.0.len() as u32;
+        self.0.insert(k.to_vec(), i);
+        i
+    }
+}
 
 pub enum Node {
     /// Text, already JSON-escaped.
     Text(Vec<u8>),
-    Var(Vec<Vec<u8>>),
-    Raw(Vec<Vec<u8>>),
-    If(bool, Vec<Vec<u8>>, Vec<Node>, Option<Vec<Node>>),
-    For(Vec<u8>, Vec<Vec<u8>>, Vec<Node>),
+    Var(Vec<u32>),
+    Raw(Vec<u32>),
+    If(bool, Vec<u32>, Vec<Node>, Option<Vec<Node>>),
+    For(u32, Vec<u32>, Vec<Node>),
     Include(Vec<u8>),
 }
 
@@ -23,22 +84,36 @@ pub enum V {
     Null,
     Bool(bool),
     Num(i64),
-    Str(Rc<[u8]>),
+    Str(Str),
     Arr(Rc<Vec<V>>),
-    Obj(Rc<Vec<(&'static [u8], V)>>),
+    Obj(Rc<Vec<(u32, V)>>),
     Loop(u32, u32),
 }
 
-pub fn s(b: &[u8]) -> V {
-    V::Str(Rc::from(b))
+/// A string templates see, with its HTML-and-JSON and its JSON escaping kept once made (a card's excerpt or a
+/// tag's name is written on page after page).
+pub struct S {
+    pub b: Vec<u8>,
+    html_json: OnceCell<Vec<u8>>,
+    json: OnceCell<Vec<u8>>,
 }
 
-pub fn obj(fields: Vec<(&'static [u8], V)>) -> V {
+pub type Str = Rc<S>;
+
+pub fn st(b: &[u8]) -> Str {
+    Rc::new(S { b: b.to_vec(), html_json: OnceCell::new(), json: OnceCell::new() })
+}
+
+pub fn s(b: &[u8]) -> V {
+    V::Str(st(b))
+}
+
+pub fn obj(fields: Vec<(u32, V)>) -> V {
     V::Obj(Rc::new(fields))
 }
 
 pub struct Frame<'a> {
-    pub vars: &'a [(&'a [u8], V)],
+    pub vars: &'a [(u32, V)],
     pub parent: Option<&'a Frame<'a>>,
 }
 
@@ -54,7 +129,7 @@ fn is_ident(c: u8) -> bool {
     c.is_ascii_alphanumeric() || c == b'_'
 }
 
-fn path_of(name: &[u8], text: &[u8]) -> Result<Vec<Vec<u8>>, Vec<u8>> {
+fn path_of(name: &[u8], text: &[u8], keys: &mut Keys) -> Result<Vec<u32>, Vec<u8>> {
     let ok = !text.is_empty()
         && text.split(|&c| c == b'.').all(|seg| !seg.is_empty() && is_ident_start(seg[0]) && seg.iter().all(|&c| is_ident(c)));
     if !ok {
@@ -63,7 +138,7 @@ fn path_of(name: &[u8], text: &[u8]) -> Result<Vec<Vec<u8>>, Vec<u8>> {
         m.extend_from_slice(b"\" is not a path");
         return Err(err(name, &m));
     }
-    Ok(text.split(|&c| c == b'.').map(|seg| seg.to_vec()).collect())
+    Ok(text.split(|&c| c == b'.').map(|seg| keys.id(seg)).collect())
 }
 
 /// \S+ to the end.
@@ -113,15 +188,15 @@ fn include_tag(tag: &[u8]) -> Option<&[u8]> {
 
 enum Tok {
     Text(Vec<u8>),
-    Var(Vec<Vec<u8>>, bool),
+    Var(Vec<u32>, bool),
     Tag(Vec<u8>),
 }
 
 struct Open {
     is_for: bool,
-    name: Vec<u8>,
+    name: u32,
     not: bool,
-    path: Vec<Vec<u8>>,
+    path: Vec<u32>,
     body: Vec<Node>,
     els: Option<Vec<Node>>,
 }
@@ -137,7 +212,7 @@ fn cur<'a>(root: &'a mut Vec<Node>, stack: &'a mut [Open]) -> &'a mut Vec<Node> 
 }
 
 /// A template parsed, or its error as makefun-site words it.
-pub fn parse(name: &[u8], src: &[u8]) -> Result<Vec<Node>, Vec<u8>> {
+pub fn parse(name: &[u8], src: &[u8], keys: &mut Keys) -> Result<Vec<Node>, Vec<u8>> {
     let mut toks = Vec::new();
     let mut text: Vec<u8> = Vec::new();
     let n = src.len();
@@ -172,7 +247,7 @@ pub fn parse(name: &[u8], src: &[u8]) -> Result<Vec<Node>, Vec<u8>> {
             if !text.is_empty() {
                 toks.push(Tok::Text(std::mem::take(&mut text)));
             }
-            toks.push(Tok::Var(path_of(name, trim_u(&src[from..close]))?, raw));
+            toks.push(Tok::Var(path_of(name, trim_u(&src[from..close]), keys)?, raw));
             i = close + pat.len();
             continue;
         }
@@ -211,11 +286,12 @@ pub fn parse(name: &[u8], src: &[u8]) -> Result<Vec<Node>, Vec<u8>> {
             Tok::Var(p, raw) => cur(&mut root, &mut stack).push(if raw { Node::Raw(p) } else { Node::Var(p) }),
             Tok::Tag(tag) => {
                 if let Some((nm, p)) = for_tag(&tag) {
-                    let path = path_of(name, p)?;
-                    stack.push(Open { is_for: true, name: nm.to_vec(), not: false, path, body: Vec::new(), els: None });
+                    let path = path_of(name, p, keys)?;
+                    let nm = keys.id(nm);
+                    stack.push(Open { is_for: true, name: nm, not: false, path, body: Vec::new(), els: None });
                 } else if let Some((not, p)) = if_tag(&tag) {
-                    let path = path_of(name, p)?;
-                    stack.push(Open { is_for: false, name: Vec::new(), not, path, body: Vec::new(), els: None });
+                    let path = path_of(name, p, keys)?;
+                    stack.push(Open { is_for: false, name: 0, not, path, body: Vec::new(), els: None });
                 } else if tag == b"else" {
                     match stack.last_mut() {
                         Some(top) if !top.is_for && top.els.is_none() => top.els = Some(Vec::new()),
@@ -244,21 +320,20 @@ pub fn parse(name: &[u8], src: &[u8]) -> Result<Vec<Node>, Vec<u8>> {
     Ok(root)
 }
 
-fn walk(v: &V, keys: &[Vec<u8>]) -> V {
+fn walk(v: &V, keys: &[u32]) -> V {
     let mut v = v.clone();
-    for k in keys {
-        let k = k.as_slice();
+    for &k in keys {
         v = match &v {
             V::Obj(o) => match o.iter().find(|(kk, _)| *kk == k) {
                 Some((_, x)) => x.clone(),
                 None => return V::Null,
             },
-            V::Arr(a) if k == b"length" => V::Num(a.len() as i64),
+            V::Arr(a) if k == K_LENGTH => V::Num(a.len() as i64),
             V::Loop(i, n) => match k {
-                b"index" => V::Num(*i as i64 + 1),
-                b"first" => V::Bool(*i == 0),
-                b"last" => V::Bool(*i + 1 == *n),
-                b"length" => V::Num(*n as i64),
+                K_INDEX => V::Num(*i as i64 + 1),
+                K_FIRST => V::Bool(*i == 0),
+                K_LAST => V::Bool(*i + 1 == *n),
+                K_LENGTH => V::Num(*n as i64),
                 _ => return V::Null,
             },
             _ => return V::Null,
@@ -267,8 +342,8 @@ fn walk(v: &V, keys: &[Vec<u8>]) -> V {
     v
 }
 
-fn lookup(f: &Frame, path: &[Vec<u8>]) -> V {
-    let head = path[0].as_slice();
+fn lookup(f: &Frame, path: &[u32]) -> V {
+    let head = path[0];
     let mut cur = Some(f);
     while let Some(fr) = cur {
         if let Some((_, v)) = fr.vars.iter().find(|(k, _)| *k == head) {
@@ -284,7 +359,7 @@ fn truthy(v: &V) -> bool {
         V::Null => false,
         V::Bool(b) => *b,
         V::Num(n) => *n != 0,
-        V::Str(s) => !s.is_empty(),
+        V::Str(s) => !s.b.is_empty(),
         V::Arr(a) => !a.is_empty(),
         V::Obj(_) | V::Loop(..) => true,
     }
@@ -294,13 +369,38 @@ fn truthy(v: &V) -> bool {
 fn emit(v: &V, out: &mut Vec<u8>, html: bool) {
     match v {
         V::Str(s) => {
-            if html {
-                html_json_into(out, s)
+            let e = if html {
+                s.html_json.get_or_init(|| {
+                    let mut e = Vec::with_capacity(s.b.len());
+                    html_json_into(&mut e, &s.b);
+                    e
+                })
             } else {
-                json_into(out, s)
-            }
+                s.json.get_or_init(|| {
+                    let mut e = Vec::with_capacity(s.b.len());
+                    json_into(&mut e, &s.b);
+                    e
+                })
+            };
+            out.extend_from_slice(e);
         }
-        V::Num(n) => out.extend_from_slice(n.to_string().as_bytes()),
+        V::Num(n) => {
+            let mut buf = [0u8; 20];
+            let mut k = buf.len();
+            let mut x = n.unsigned_abs();
+            loop {
+                k -= 1;
+                buf[k] = b'0' + (x % 10) as u8;
+                x /= 10;
+                if x == 0 {
+                    break;
+                }
+            }
+            if *n < 0 {
+                out.push(b'-');
+            }
+            out.extend_from_slice(&buf[k..]);
+        }
         V::Bool(b) => out.extend_from_slice(if *b { b"true" } else { b"false" }),
         V::Arr(a) => {
             for (k, x) in a.iter().enumerate() {
@@ -336,11 +436,11 @@ pub fn render(nodes: &[Node], f: &Frame, tpls: &Map<Vec<u8>, Vec<Node>>, depth: 
                         let rec = V::Loop(k as u32, len);
                         let pair;
                         let one;
-                        let vars: &[(&[u8], V)] = if name.as_slice() == b"loop" {
-                            one = [(b"loop" as &[u8], rec)];
+                        let vars: &[(u32, V)] = if *name == K_LOOP {
+                            one = [(K_LOOP, rec)];
                             &one
                         } else {
-                            pair = [(name.as_slice(), x.clone()), (b"loop" as &[u8], rec)];
+                            pair = [(*name, x.clone()), (K_LOOP, rec)];
                             &pair
                         };
                         let fr = Frame { vars, parent: Some(f) };

@@ -166,11 +166,11 @@ pub fn inline(t: &[u8], out: &mut Vec<u8>, link: &mut Link) {
     let mut run = 0;
     let mut i = 0;
     while i < n {
-        let c = t[i];
-        if CLASS[c as usize] & 4 == 0 {
-            i += 1;
-            continue;
+        i = next_inline(t, i);
+        if i >= n {
+            break;
         }
+        let c = t[i];
         match c {
             b'&' | b'<' | b'>' | b'"' | b'\'' => {
                 out.extend_from_slice(&t[run..i]);
@@ -319,21 +319,20 @@ pub fn render(src: &[u8], link: &mut Link, slug: &mut Slug) -> Md {
         if c0 == b'#' {
             if let Some((depth, text)) = heading(ln) {
                 let id = unique_slug(&slug(text), &mut ids);
-                let mut ih = Vec::new();
-                inline(text, &mut ih, link);
                 let d = b'0' + depth as u8;
                 html.extend_from_slice(b"<h");
                 html.push(d);
                 html.extend_from_slice(b" id=\"");
                 html.extend_from_slice(&id);
                 html.extend_from_slice(b"\">");
-                html.extend_from_slice(&ih);
+                let at = html.len();
+                inline(text, &mut html, link);
+                if depth == 2 || depth == 3 {
+                    toc.push((depth as u8, id, html[at..].to_vec()));
+                }
                 html.extend_from_slice(b"</h");
                 html.push(d);
                 html.extend_from_slice(b">\n");
-                if depth == 2 || depth == 3 {
-                    toc.push((depth as u8, id, ih));
-                }
                 i += 1;
                 continue;
             }
@@ -440,14 +439,13 @@ pub fn render(src: &[u8], link: &mut Link, slug: &mut Slug) -> Md {
             joined = t;
             &joined
         };
-        let mut ih = Vec::with_capacity(text.len() + 16);
-        inline(text, &mut ih, link);
         html.extend_from_slice(b"<p>");
-        html.extend_from_slice(&ih);
-        html.extend_from_slice(b"</p>\n");
+        let at = html.len();
+        inline(text, &mut html, link);
         if excerpt.is_none() {
-            excerpt = Some(ih);
+            excerpt = Some(html[at..].to_vec());
         }
+        html.extend_from_slice(b"</p>\n");
     }
     Md { html, toc, excerpt: excerpt.unwrap_or_default() }
 }

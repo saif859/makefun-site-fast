@@ -3,7 +3,7 @@
 use crate::json::J;
 use crate::md;
 use crate::text::*;
-use crate::tpl::{self, obj, s, Frame, Node, V};
+use crate::tpl::{self, obj, s, st, Frame, Node, Str, V};
 
 use std::rc::Rc;
 
@@ -11,21 +11,21 @@ const REPORT_FILE: &[u8] = b"build-report.txt";
 const RESERVED: [&[u8]; 3] = [b"posts", b"tags", b"page"];
 const KEYS: [&[u8]; 7] = [b"title", b"date", b"tags", b"draft", b"layout", b"slug", b"summary"];
 
-pub struct Input {
-    title: Vec<u8>,
-    base_url: Vec<u8>,
+pub struct Input<'j> {
+    title: &'j [u8],
+    base_url: &'j [u8],
     per_page: usize,
     recent: usize,
-    files: Vec<(Vec<u8>, Vec<u8>)>,
-    templates: Vec<(Vec<u8>, Vec<u8>)>,
+    files: Vec<(&'j [u8], &'j [u8])>,
+    templates: Vec<(&'j [u8], &'j [u8])>,
 }
 
-impl Input {
+impl<'j> Input<'j> {
     /// The input this build takes exactly, or None (main.ts then builds the case in JavaScript).
-    pub fn from_json(j: &J) -> Option<Input> {
+    pub fn from_json(j: &'j J<'j>) -> Option<Input<'j>> {
         let site = j.get(b"site")?;
-        let title = site.get(b"title")?.str()?.to_vec();
-        let base_url = site.get(b"base_url")?.str()?.to_vec();
+        let title = site.get(b"title")?.str()?;
+        let base_url = site.get(b"base_url")?.str()?;
         let int = |v: Option<&J>, min: f64| -> Option<usize> {
             match v? {
                 J::Num(x) if x.fract() == 0.0 && *x >= min && *x < 1e9 => Some(*x as usize),
@@ -37,12 +37,12 @@ impl Input {
         let J::Arr(fs) = j.get(b"files")? else { return None };
         let mut files = Vec::with_capacity(fs.len());
         for f in fs {
-            files.push((f.get(b"path")?.str()?.to_vec(), f.get(b"content")?.str()?.to_vec()));
+            files.push((f.get(b"path")?.str()?, f.get(b"content")?.str()?));
         }
         let J::Obj(ts) = j.get(b"templates")? else { return None };
         let mut templates = Vec::with_capacity(ts.len());
         for (k, v) in ts {
-            templates.push((k.clone(), v.str()?.to_vec()));
+            templates.push((*k, v.str()?));
         }
         Some(Input { title, base_url, per_page, recent, files, templates })
     }
@@ -308,14 +308,14 @@ fn has_scheme(t: &[u8]) -> bool {
 
 struct Src<'a> {
     path: &'a [u8],
-    text: Vec<u8>,
+    text: std::borrow::Cow<'a, [u8]>,
     body_at: usize,
     fm: Fm,
     post: bool,
     layout: Vec<u8>,
     slug: Vec<u8>,
     out_dir: Vec<u8>,
-    url: Rc<[u8]>,
+    url: Str,
 }
 
 impl<'a> Src<'a> {
@@ -326,13 +326,13 @@ impl<'a> Src<'a> {
 
 enum TagRef {
     Tag(usize),
-    Own(Rc<[u8]>, Rc<[u8]>),
+    Own(Str, Str),
 }
 
 struct Tag {
-    name: Rc<[u8]>,
-    slug: Rc<[u8]>,
-    url: Rc<[u8]>,
+    name: Str,
+    slug: Str,
+    url: Str,
     posts: Vec<usize>,
 }
 
@@ -372,36 +372,37 @@ pub fn run(inp: &Input, out: &mut Vec<u8>) -> bool {
     let mut report: Vec<Vec<u8>> = Vec::new();
 
     // Templates, parsed in name order; one that does not parse is reported.
-    let mut names: Vec<&(Vec<u8>, Vec<u8>)> = inp.templates.iter().collect();
+    let mut names: Vec<&(&[u8], &[u8])> = inp.templates.iter().collect();
     names.sort_by(|a, b| cmp_units(&a.0, &b.0));
+    let mut keys = tpl::Keys::new();
     let mut templates: Map<Vec<u8>, Vec<Node>> = Map::default();
     for (name, src) in names {
-        match tpl::parse(name, src) {
+        match tpl::parse(name, src, &mut keys) {
             Ok(n) => {
-                templates.insert(name.clone(), n);
+                templates.insert(name.to_vec(), n);
             }
             Err(e) => report.push(e),
         }
     }
-    let mut base: &[u8] = &inp.base_url;
+    let mut base: &[u8] = inp.base_url;
     while base.last() == Some(&b'/') {
         base = &base[..base.len() - 1];
     }
 
     // 1. Sources in code-unit order of path; .md are sources, the rest static.
-    let mut files: Vec<&(Vec<u8>, Vec<u8>)> = inp.files.iter().collect();
+    let mut files: Vec<&(&[u8], &[u8])> = inp.files.iter().collect();
     files.sort_by(|a, b| cmp_units(&a.0, &b.0));
-    let mut statics: Vec<&(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut statics: Vec<&(&[u8], &[u8])> = Vec::new();
     let mut kept: Vec<Src> = Vec::new();
     for f in files {
         if !f.0.ends_with(b".md") {
             statics.push(f);
             continue;
         }
-        let path = f.0.as_slice();
-        let c = &f.1;
-        let text = if find_byte(c, b'\r').is_none() {
-            c.clone()
+        let path = f.0;
+        let c = f.1;
+        let text: std::borrow::Cow<[u8]> = if find_byte(c, b'\r').is_none() {
+            std::borrow::Cow::Borrowed(c)
         } else {
             let mut t = Vec::with_capacity(c.len());
             let mut i = 0;
@@ -416,7 +417,7 @@ pub fn run(inp: &Input, out: &mut Vec<u8>) -> bool {
                 }
                 i += 1;
             }
-            t
+            std::borrow::Cow::Owned(t)
         };
         // 2. Front matter.
         let (fm, body_at) = match parse_fm(&text) {
@@ -448,7 +449,7 @@ pub fn run(inp: &Input, out: &mut Vec<u8>) -> bool {
             report.push(msg(&[b"draft ", path]));
             continue;
         }
-        kept.push(Src { path, text, body_at, fm, post, layout, slug: Vec::new(), out_dir: Vec::new(), url: Rc::from(&b""[..]) });
+        kept.push(Src { path, text, body_at, fm, post, layout, slug: Vec::new(), out_dir: Vec::new(), url: st(b"") });
     }
 
     phase!(t0, "sources+fm");
@@ -464,13 +465,13 @@ pub fn run(inp: &Input, out: &mut Vec<u8>) -> bool {
         };
         s.slug = unique_slug(&wanted, set);
         s.out_dir = if dir.is_empty() { s.slug.clone() } else { [dir, b"/", &s.slug].concat() };
-        s.url = Rc::from([base, b"/", &s.out_dir, b"/"].concat());
+        s.url = st(&[base, b"/", &s.out_dir, b"/"].concat());
         by_source.insert(s.path, k);
     }
 
     phase!(t0, "permalinks");
     // 4. Markdown, links resolved.
-    let static_paths: Set<&[u8]> = statics.iter().map(|f| f.0.as_slice()).collect();
+    let static_paths: Set<&[u8]> = statics.iter().map(|f| f.0).collect();
     let mut broken: Vec<Vec<u8>> = Vec::new();
     let mut broken_seen: Set<Vec<u8>> = Set::default();
     let mut mds: Vec<md::Md> = Vec::with_capacity(kept.len());
@@ -488,7 +489,7 @@ pub fn run(inp: &Input, out: &mut Vec<u8>) -> bool {
             if !rel.is_empty() {
                 if let Some(path) = resolve_path(dir, rel) {
                     if let Some(&hit) = by_source.get(path.as_slice()) {
-                        return [&kept[hit].url[..], frag].concat();
+                        return [&kept[hit].url.b[..], frag].concat();
                     }
                     if static_paths.contains(path.as_slice()) {
                         return [base, b"/", &path, frag].concat();
@@ -541,9 +542,9 @@ pub fn run(inp: &Input, out: &mut Vec<u8>) -> bool {
                 Some(&t) => t,
                 None => {
                     tags.push(Tag {
-                        name: Rc::from(name.as_slice()),
-                        url: Rc::from([base, b"/tags/", &slug, b"/"].concat()),
-                        slug: Rc::from(slug.as_slice()),
+                        name: st(&name),
+                        url: st(&[base, b"/tags/", &slug, b"/"].concat()),
+                        slug: st(&slug),
                         posts: Vec::new(),
                     });
                     by_slug.insert(slug, tags.len() - 1);
@@ -560,13 +561,13 @@ pub fn run(inp: &Input, out: &mut Vec<u8>) -> bool {
                 .into_iter()
                 .map(|(name, slug)| match by_slug.get(&slug) {
                     Some(&t) => TagRef::Tag(t),
-                    None => TagRef::Own(Rc::from(name.as_slice()), Rc::from(slug.as_slice())),
+                    None => TagRef::Own(st(&name), st(&slug)),
                 })
                 .collect();
         }
     }
     let mut tag_list: Vec<usize> = (0..tags.len()).collect();
-    tag_list.sort_by(|&x, &y| tags[y].posts.len().cmp(&tags[x].posts.len()).then_with(|| cmp_units(&tags[x].slug, &tags[y].slug)));
+    tag_list.sort_by(|&x, &y| tags[y].posts.len().cmp(&tags[x].posts.len()).then_with(|| cmp_units(&tags[x].slug.b, &tags[y].slug.b)));
 
     phase!(t0, "posts+tags");
     // 7. Layouts.
@@ -577,26 +578,26 @@ pub fn run(inp: &Input, out: &mut Vec<u8>) -> bool {
             None => (empty.clone(), empty.clone()),
         }
     };
-    let card_fields = |k: usize| -> Vec<(&'static [u8], V)> {
+    let card_fields = |k: usize| -> Vec<(u32, V)> {
         let src = &kept[k];
         let (date, date_long) = date_of(k);
         let card_tags: Vec<V> = tag_refs[k]
             .iter()
             .map(|r| match r {
-                TagRef::Tag(t) => obj(vec![(b"name", V::Str(tags[*t].name.clone())), (b"slug", V::Str(tags[*t].slug.clone())), (b"url", V::Str(tags[*t].url.clone()))]),
-                TagRef::Own(name, slug) => obj(vec![(b"name", V::Str(name.clone())), (b"slug", V::Str(slug.clone())), (b"url", empty.clone())]),
+                TagRef::Tag(t) => obj(vec![(tpl::K_NAME, V::Str(tags[*t].name.clone())), (tpl::K_SLUG, V::Str(tags[*t].slug.clone())), (tpl::K_URL, V::Str(tags[*t].url.clone()))]),
+                TagRef::Own(name, slug) => obj(vec![(tpl::K_NAME, V::Str(name.clone())), (tpl::K_SLUG, V::Str(slug.clone())), (tpl::K_URL, empty.clone())]),
             })
             .collect();
         let minutes = words(src.body()).div_ceil(200).max(1);
         vec![
-            (b"title", s(src.fm.title.as_ref().unwrap())),
-            (b"url", V::Str(src.url.clone())),
-            (b"date", date),
-            (b"date_long", date_long),
-            (b"summary", src.fm.summary.as_deref().map(s).unwrap_or_else(|| empty.clone())),
-            (b"excerpt", s(&mds[k].excerpt)),
-            (b"reading_minutes", V::Num(minutes as i64)),
-            (b"tags", V::Arr(Rc::new(card_tags))),
+            (tpl::K_TITLE, s(src.fm.title.as_ref().unwrap())),
+            (tpl::K_URL, V::Str(src.url.clone())),
+            (tpl::K_DATE, date),
+            (tpl::K_DATE_LONG, date_long),
+            (tpl::K_SUMMARY, src.fm.summary.as_deref().map(s).unwrap_or_else(|| empty.clone())),
+            (tpl::K_EXCERPT, s(&mds[k].excerpt)),
+            (tpl::K_READING_MINUTES, V::Num(minutes as i64)),
+            (tpl::K_TAGS, V::Arr(Rc::new(card_tags))),
         ]
     };
     let mut cards: Vec<Option<V>> = vec![None; kept.len()];
@@ -604,13 +605,13 @@ pub fn run(inp: &Input, out: &mut Vec<u8>) -> bool {
         cards[p] = Some(obj(card_fields(p)));
     }
     let card = |k: usize| cards[k].clone().unwrap();
-    let site = obj(vec![(b"title", s(&inp.title)), (b"base_url", s(base))]);
+    let site = obj(vec![(tpl::K_TITLE, s(inp.title)), (tpl::K_BASE_URL, s(base))]);
     let all_tags = V::Arr(Rc::new(
         tag_list
             .iter()
             .map(|&t| {
                 let tg = &tags[t];
-                obj(vec![(b"name", V::Str(tg.name.clone())), (b"slug", V::Str(tg.slug.clone())), (b"url", V::Str(tg.url.clone())), (b"count", V::Num(tg.posts.len() as i64))])
+                obj(vec![(tpl::K_NAME, V::Str(tg.name.clone())), (tpl::K_SLUG, V::Str(tg.slug.clone())), (tpl::K_URL, V::Str(tg.url.clone())), (tpl::K_COUNT, V::Num(tg.posts.len() as i64))])
             })
             .collect(),
     ));
@@ -620,16 +621,16 @@ pub fn run(inp: &Input, out: &mut Vec<u8>) -> bool {
             None => V::Null,
             Some(k) => {
                 let (date, date_long) = date_of(k);
-                obj(vec![(b"title", s(kept[k].fm.title.as_ref().unwrap())), (b"url", V::Str(kept[k].url.clone())), (b"date", date), (b"date_long", date_long)])
+                obj(vec![(tpl::K_TITLE, s(kept[k].fm.title.as_ref().unwrap())), (tpl::K_URL, V::Str(kept[k].url.clone())), (tpl::K_DATE, date), (tpl::K_DATE_LONG, date_long)])
             }
         }
     };
 
     phase!(t0, "cards");
     let mut w = Out { out, first: true, keys: Set::default() };
-    let render_top = |w: &mut Out, key: &[u8], name: &[u8], extra: Vec<(&'static [u8], V)>| {
+    let render_top = |w: &mut Out, key: &[u8], name: &[u8], extra: Vec<(u32, V)>| {
         let t = &templates[name];
-        let mut vars: Vec<(&[u8], V)> = vec![(b"site", site.clone()), (b"tags", all_tags.clone()), (b"recent", recent.clone())];
+        let mut vars: Vec<(u32, V)> = vec![(tpl::K_SITE, site.clone()), (tpl::K_TAGS, all_tags.clone()), (tpl::K_RECENT, recent.clone())];
         vars.extend(extra);
         w.open(key);
         tpl::render(t, &Frame { vars: &vars, parent: None }, &templates, 0, w.out);
@@ -644,16 +645,16 @@ pub fn run(inp: &Input, out: &mut Vec<u8>) -> bool {
         let toc = mds[k]
             .toc
             .iter()
-            .map(|(level, id, html)| obj(vec![(b"level", V::Num(*level as i64)), (b"id", s(id)), (b"html", s(html))]))
+            .map(|(level, id, html)| obj(vec![(tpl::K_LEVEL, V::Num(*level as i64)), (tpl::K_ID, s(id)), (tpl::K_HTML, s(html))]))
             .collect();
-        fields.push((b"slug", s(&src.slug)));
-        fields.push((b"content", s(&mds[k].html)));
-        fields.push((b"toc", V::Arr(Rc::new(toc))));
-        fields.push((b"newer", link_of(newer[k])));
-        fields.push((b"older", link_of(older[k])));
-        fields.push((b"is_post", V::Bool(src.post)));
+        fields.push((tpl::K_SLUG, s(&src.slug)));
+        fields.push((tpl::K_CONTENT, s(&mds[k].html)));
+        fields.push((tpl::K_TOC, V::Arr(Rc::new(toc))));
+        fields.push((tpl::K_NEWER, link_of(newer[k])));
+        fields.push((tpl::K_OLDER, link_of(older[k])));
+        fields.push((tpl::K_IS_POST, V::Bool(src.post)));
         let key = [&src.out_dir[..], b"/index.html"].concat();
-        render_top(&mut w, &key, &src.layout, vec![(b"page", obj(fields))]);
+        render_top(&mut w, &key, &src.layout, vec![(tpl::K_PAGE, obj(fields))]);
     }
     phase!(t0, "pages");
     let per = inp.per_page;
@@ -671,28 +672,28 @@ pub fn run(inp: &Input, out: &mut Vec<u8>) -> bool {
             let hi = (k * per).min(posts.len());
             let list = V::Arr(Rc::new(posts[lo..hi].iter().map(|&p| card(p)).collect()));
             let pager = obj(vec![
-                (b"number", V::Num(k as i64)),
-                (b"total", V::Num(pages as i64)),
-                (b"url", index_url(k)),
-                (b"newer_url", if k == 1 { empty.clone() } else { index_url(k - 1) }),
-                (b"older_url", if k == pages { empty.clone() } else { index_url(k + 1) }),
+                (tpl::K_NUMBER, V::Num(k as i64)),
+                (tpl::K_TOTAL, V::Num(pages as i64)),
+                (tpl::K_URL, index_url(k)),
+                (tpl::K_NEWER_URL, if k == 1 { empty.clone() } else { index_url(k - 1) }),
+                (tpl::K_OLDER_URL, if k == pages { empty.clone() } else { index_url(k + 1) }),
             ]);
             let key = if k == 1 { b"index.html".to_vec() } else { [b"page/" as &[u8], k.to_string().as_bytes(), b"/index.html"].concat() };
-            render_top(&mut w, &key, b"index", vec![(b"posts", list), (b"pager", pager)]);
+            render_top(&mut w, &key, b"index", vec![(tpl::K_POSTS, list), (tpl::K_PAGER, pager)]);
         }
     }
     if templates.contains_key(&b"tag"[..]) {
         for &t in &tag_list {
             let tg = &tags[t];
             let tag = obj(vec![
-                (b"name", V::Str(tg.name.clone())),
-                (b"slug", V::Str(tg.slug.clone())),
-                (b"url", V::Str(tg.url.clone())),
-                (b"count", V::Num(tg.posts.len() as i64)),
-                (b"posts", V::Arr(Rc::new(tg.posts.iter().map(|&p| card(p)).collect()))),
+                (tpl::K_NAME, V::Str(tg.name.clone())),
+                (tpl::K_SLUG, V::Str(tg.slug.clone())),
+                (tpl::K_URL, V::Str(tg.url.clone())),
+                (tpl::K_COUNT, V::Num(tg.posts.len() as i64)),
+                (tpl::K_POSTS, V::Arr(Rc::new(tg.posts.iter().map(|&p| card(p)).collect()))),
             ]);
-            let key = [b"tags/" as &[u8], &tg.slug, b"/index.html"].concat();
-            render_top(&mut w, &key, b"tag", vec![(b"tag", tag)]);
+            let key = [b"tags/" as &[u8], &tg.slug.b, b"/index.html"].concat();
+            render_top(&mut w, &key, b"tag", vec![(tpl::K_TAG, tag)]);
         }
     }
     if templates.contains_key(&b"tags"[..]) {
@@ -700,7 +701,7 @@ pub fn run(inp: &Input, out: &mut Vec<u8>) -> bool {
     }
     phase!(t0, "index+tags");
     for f in &statics {
-        let path = f.0.as_slice();
+        let path = f.0;
         // JavaScript puts array-index keys first and would overwrite a static build-report.txt in place: not taken here.
         if path == REPORT_FILE || (!path.is_empty() && path.iter().all(|c| c.is_ascii_digit())) {
             return false;
@@ -709,7 +710,7 @@ pub fn run(inp: &Input, out: &mut Vec<u8>) -> bool {
             report.push(msg(&[b"shadowed ", path, b": a built page has its path"]));
         } else {
             w.open(path);
-            json_into(w.out, &f.1);
+            json_into(w.out, f.1);
             w.close();
         }
     }

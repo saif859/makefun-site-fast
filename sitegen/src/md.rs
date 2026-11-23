@@ -160,94 +160,158 @@ fn find_single_star(s: &[u8], from: usize) -> Option<usize> {
     None
 }
 
-/// makefun-site's inline Markdown of raw text t, its text HTML-escaped, appended to out as the inside of a
-/// JSON string.
-pub fn inline(t: &[u8], out: &mut Vec<u8>, link: &mut Link) {
+/// Text from i up to the next character inline Markdown acts on (\ ` * [), appended to out HTML- and JSON-escaped:
+/// that character's index, or t.len().
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn esc_run(t: &[u8], mut i: usize, out: &mut Vec<u8>) -> usize {
+    use std::arch::x86_64::*;
     let n = t.len();
-    let mut run = 0;
-    let mut i = 0;
+    let mut run = i;
+    unsafe {
+        let p = t.as_ptr();
+        let low = _mm_set1_epi8(0x1f);
+        let set = [b'&', b'<', b'>', b'"', b'\'', b'\\', b'`', b'*', b'['].map(|c| _mm_set1_epi8(c as i8));
+        while i + 16 <= n {
+            let v = _mm_loadu_si128(p.add(i) as *const __m128i);
+            let mut m = _mm_cmpeq_epi8(_mm_min_epu8(v, low), v);
+            for s in set {
+                m = _mm_or_si128(m, _mm_cmpeq_epi8(v, s));
+            }
+            let mut mask = _mm_movemask_epi8(m) as u32;
+            // Every flagged byte of the block in turn: escapes written here, Markdown's own characters returned.
+            while mask != 0 {
+                let k = i + mask.trailing_zeros() as usize;
+                mask &= mask - 1;
+                let c = *p.add(k);
+                out.put(&t[run..k]);
+                if let Some(e) = entity(c) {
+                    out.put(e);
+                } else if c < 0x20 {
+                    json_escape(out, c);
+                } else {
+                    return k;
+                }
+                run = k + 1;
+            }
+            i += 16;
+        }
+    }
     while i < n {
+        let c = t[i];
+        if CLASS[c as usize] & 4 != 0 {
+            out.put(&t[run..i]);
+            if let Some(e) = entity(c) {
+                out.put(e);
+            } else if c < 0x20 {
+                json_escape(out, c);
+            } else {
+                return i;
+            }
+            run = i + 1;
+        }
+        i += 1;
+    }
+    out.put(&t[run..n]);
+    n
+}
+
+/// Text from i up to the next character inline Markdown acts on (\ ` * [), appended to out HTML- and JSON-escaped:
+/// that character's index, or t.len().
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+fn esc_run(t: &[u8], mut i: usize, out: &mut Vec<u8>) -> usize {
+    let n = t.len();
+    let mut run = i;
+    loop {
         i = next_inline(t, i);
+        out.put(&t[run..i]);
         if i >= n {
-            break;
+            return n;
         }
         let c = t[i];
-        match c {
-            b'&' | b'<' | b'>' | b'"' | b'\'' => {
-                out.put(&t[run..i]);
-                out.put(entity(c).unwrap());
-                i += 1;
-                run = i;
-            }
+        if let Some(e) = entity(c) {
+            out.put(e);
+        } else if c < 0x20 {
+            json_escape(out, c);
+        } else {
+            return i;
+        }
+        i += 1;
+        run = i;
+    }
+}
+
+/// makefun-site's inline Markdown of raw text t, its text HTML-escaped, appended to out as the inside of a
+/// JSON string. Everything of t before i is written when the loop comes round.
+pub fn inline(t: &[u8], out: &mut Vec<u8>, link: &mut Link) {
+    let n = t.len();
+    let mut i = 0;
+    loop {
+        i = esc_run(t, i, out);
+        if i >= n {
+            return;
+        }
+        match t[i] {
             b'\\' => {
-                out.put(&t[run..i]);
                 if i + 1 < n && is_escapable(t[i + 1]) {
                     // The backslash goes; the character it escapes stays as text (">" as its entity, a backslash as
                     // JSON writes one).
                     match t[i + 1] {
-                        b'>' => {
-                            out.put(b"&gt;");
-                            run = i + 2;
-                        }
-                        b'\\' => {
-                            out.put(b"\\\\");
-                            run = i + 2;
-                        }
-                        _ => run = i + 1,
+                        b'>' => out.put(b"&gt;"),
+                        b'\\' => out.put(b"\\\\"),
+                        d => out.push(d),
                     }
                     i += 2;
                 } else {
                     out.put(b"\\\\");
                     i += 1;
-                    run = i;
                 }
-            }
-            0..=0x1f => {
-                out.put(&t[run..i]);
-                json_escape(out, c);
-                i += 1;
-                run = i;
             }
             b'`' => match find_byte(&t[i + 1..], b'`') {
                 Some(off) if off > 0 => {
                     let j = i + 1 + off;
-                    out.put(&t[run..i]);
                     out.put(b"<code>");
                     html_json_into(out, &t[i + 1..j]);
                     out.put(b"</code>");
                     i = j + 1;
-                    run = i;
                 }
-                _ => i += 1,
+                _ => {
+                    out.push(b'`');
+                    i += 1;
+                }
             },
             b'*' => {
                 if i + 1 < n && t[i + 1] == b'*' {
                     match find_double(t, i + 2) {
                         Some(j) if j > i + 2 => {
-                            out.put(&t[run..i]);
                             out.put(b"<strong>");
                             inline(&t[i + 2..j], out, link);
                             out.put(b"</strong>");
                             i = j + 2;
-                            run = i;
                         }
-                        _ => i += 2,
+                        _ => {
+                            out.put(b"**");
+                            i += 2;
+                        }
                     }
                 } else {
                     match find_single_star(t, i + 1) {
                         Some(j) if j > i + 1 => {
-                            out.put(&t[run..i]);
                             out.put(b"<em>");
                             inline(&t[i + 1..j], out, link);
                             out.put(b"</em>");
                             i = j + 1;
-                            run = i;
                         }
-                        _ => i += 1,
+                        _ => {
+                            out.push(b'*');
+                            i += 1;
+                        }
                     }
                 }
             }
-            b'[' => {
+            _ => {
+                // "[": a link when "](target)" follows, the target non-empty with no \s.
                 let k = find_close(t, i + 1);
                 let m = match k {
                     Some(k) if k + 1 < n && t[k + 1] == b'(' => find_byte(&t[k + 2..], b')').map(|o| k + 2 + o),
@@ -256,23 +320,20 @@ pub fn inline(t: &[u8], out: &mut Vec<u8>, link: &mut Link) {
                 if let (Some(k), Some(m)) = (k, m) {
                     if m > k + 2 && !has_space(&t[k + 2..m]) {
                         let href = link(&t[k + 2..m]);
-                        out.put(&t[run..i]);
                         out.put(b"<a href=\\\"");
                         html_json_into(out, &href);
                         out.put(b"\\\">");
                         inline(&t[i + 1..k], out, link);
                         out.put(b"</a>");
                         i = m + 1;
-                        run = i;
                         continue;
                     }
                 }
+                out.push(b'[');
                 i += 1;
             }
-            _ => i += 1,
         }
     }
-    out.put(&t[run..]);
 }
 
 /// A source body rendered: its HTML, its h2 and h3 entries and its first paragraph's HTML, each as the inside of

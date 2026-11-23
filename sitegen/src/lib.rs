@@ -14,9 +14,20 @@ use std::cell::RefCell;
 /// The allocator: blocks handed out in order from big chunks (WebAssembly memory grown 16 MB at a time, or 64 MB
 /// from the system), freeing is nothing and the last block grows in place. A case's blocks are all given back at
 /// once when it is done (mark and release), so one case's memory is the next one's.
-mod arena {
+pub mod arena {
     use std::alloc::{GlobalAlloc, Layout};
     use std::cell::Cell;
+
+    #[cfg(feature = "timing")]
+    thread_local! { pub static TAKEN: Cell<usize> = const { Cell::new(0) }; }
+    #[cfg(feature = "timing")]
+    pub fn taken() -> usize {
+        TAKEN.with(|t| t.get())
+    }
+    #[cfg(feature = "timing")]
+    pub fn high() -> (usize, usize) {
+        (super::ALLOC.next.get(), super::ALLOC.end.get())
+    }
 
     pub struct Arena {
         next: Cell<usize>,
@@ -54,6 +65,10 @@ mod arena {
         }
 
         unsafe fn take(&self, size: usize, align: usize) -> *mut u8 {
+            #[cfg(feature = "timing")]
+            {
+                TAKEN.with(|t| t.set(t.get() + size));
+            }
             let a = (self.next.get() + align - 1) & !(align - 1);
             if self.next.get() != 0 && a + size <= self.end.get() {
                 self.next.set(a + size);
@@ -190,6 +205,26 @@ pub fn build_all(src: &mut [u8]) -> Option<Vec<u8>> {
     }
     out.push(b']');
     Some(out)
+}
+
+/// As a Node addon on x86-64 Linux (sitegen-linux-x64.node, which main.ts loads with process.dlopen), the module's
+/// registration is the build: it reads cases.json and, when it takes every case, writes answers.json and ends the
+/// process at once (exit_group, so nothing more of Node runs; the file is closed by then). For input it does not
+/// take it returns, and main.ts goes on to main.js. It calls nothing of Node's.
+#[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
+#[no_mangle]
+pub unsafe extern "C" fn napi_register_module_v1(_env: *mut core::ffi::c_void, exports: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
+    let dir = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
+    let input = format!("{}/cases.json", dir("MAKEFUN_INPUT_DIR", "/input"));
+    let output = format!("{}/answers.json", dir("MAKEFUN_OUTPUT_DIR", "/output"));
+    if let Ok(mut bytes) = std::fs::read(&input) {
+        if let Some(out) = build_all(&mut bytes) {
+            if std::fs::write(&output, &out).is_ok() {
+                core::arch::asm!("syscall", in("rax") 231usize, in("rdi") 0usize, options(noreturn));
+            }
+        }
+    }
+    exports
 }
 
 #[no_mangle]

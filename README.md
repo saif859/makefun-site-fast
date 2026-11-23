@@ -10,9 +10,11 @@ A faster drop-in for makefun-site 1.0.0: the same output tree, byte for byte (ev
 The build is Rust (`sitegen/`): it reads the JSON itself, works on UTF-8 bytes throughout and renders the templates
 straight into the inside of each JSON string. It ships built two ways:
 
-- `sitegen-linux-x64`, a static Linux program (musl): on x86-64 Linux `main.ts` becomes it at once
-  (`process.execve`, so nothing more of Node runs), and it reads `cases.json` and writes `answers.json` itself when it
-  takes every case; for anything else it becomes `node main.js` in turn. Its slugs of non-ASCII text use the
+- `sitegen-linux-x64.node`, a Node addon (x86-64 Linux, glibc, built with profile-guided optimization): on x86-64
+  Linux `main.ts` loads it (`process.dlopen`) and its module registration is the build: it reads `cases.json` and,
+  when it takes every case, writes `answers.json` and ends the process at once (`exit_group`). It calls nothing of
+  Node's. Should it not load, `sitegen-linux-x64`, the same build as a static program (musl), takes the process's
+  place (`process.execve`). For input neither takes, `main.js` runs. Slugs of non-ASCII text use the
   `unicode-normalization` crate's NFKD and General_Category Mark, as JavaScript's `normalize('NFKD')` and `\p{M}` do.
   It scans sixteen bytes at a time (SSE2), reads the JSON in place, renders Markdown straight into JSON-escaped HTML,
   renders each template piece that reads only `site`, `tags` and `recent` once per site, and hands each case's
@@ -52,14 +54,15 @@ MAKEFUN_INPUT_DIR=<dir holding cases.json> MAKEFUN_OUTPUT_DIR=<output dir> node 
 
 `main.ts` needs Node.js 22.18 or later (it runs TypeScript as it is); `solve.js` is a dependency-free ES module.
 
-To rebuild `sitegen.wasm` and `sitegen-linux-x64` (Rust with the `wasm32-unknown-unknown` and
-`x86_64-unknown-linux-musl` targets; `sitegen/.cargo/config.toml` links the Linux program with the `rust-lld` Rust
+To rebuild them (Rust with the `wasm32-unknown-unknown`, `x86_64-unknown-linux-musl` and, on Linux with gcc,
+`x86_64-unknown-linux-gnu` targets; `sitegen/.cargo/config.toml` links the static program with the `rust-lld` Rust
 ships):
 
 ```sh
 cd sitegen
 cargo build --release --target wasm32-unknown-unknown --lib && cp target/wasm32-unknown-unknown/release/sitegen.wasm ..
-cargo build --release --target x86_64-unknown-linux-musl --bin sitegen && cp target/x86_64-unknown-linux-musl/release/sitegen ../sitegen-linux-x64
+sh build-linux.sh program   # ../sitegen-linux-x64
+sh build-linux.sh node      # ../sitegen-linux-x64.node, on Debian 12 (the grader's node:22 image) with gcc
 ```
 
 ---

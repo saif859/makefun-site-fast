@@ -598,11 +598,23 @@ pub fn words(s: &[u8]) -> usize {
                 let v = _mm_loadu_si128(p.add(i) as *const __m128i);
                 let mut lead = 0;
                 if _mm_movemask_epi8(v) != 0 {
-                    let mut m = _mm_setzero_si128();
-                    for l in leads {
-                        m = _mm_or_si128(m, _mm_cmpeq_epi8(v, l));
+                    // A byte that starts a non-ASCII \s character together with the byte after it (C2 A0, E1 9A,
+                    // E2 80, E2 81, E3 80, EF BB), so that other characters with those leads (the fi ligature, EF AC
+                    // 81, is common) stay on this path. Near the end, where the next block cannot be read, any lead.
+                    if i + 17 <= s.len() {
+                        let next = _mm_loadu_si128(p.add(i + 1) as *const __m128i);
+                        let pair = |a: __m128i, b: u8| _mm_and_si128(_mm_cmpeq_epi8(v, a), _mm_cmpeq_epi8(next, _mm_set1_epi8(b as i8)));
+                        let mut m = _mm_or_si128(pair(leads[0], 0xa0), pair(leads[1], 0x9a));
+                        m = _mm_or_si128(m, _mm_or_si128(pair(leads[2], 0x80), pair(leads[2], 0x81)));
+                        m = _mm_or_si128(m, _mm_or_si128(pair(leads[3], 0x80), pair(leads[4], 0xbb)));
+                        lead = _mm_movemask_epi8(m);
+                    } else {
+                        let mut m = _mm_setzero_si128();
+                        for l in leads {
+                            m = _mm_or_si128(m, _mm_cmpeq_epi8(v, l));
+                        }
+                        lead = _mm_movemask_epi8(m);
                     }
-                    lead = _mm_movemask_epi8(m);
                 }
                 if lead == 0 {
                     // Whitespace: a space, or 9-13 (v - 9 at most 4, unsigned).

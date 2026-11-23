@@ -1,2 +1,4 @@
 sitegen/target/
 sitegen/target-prof/
+sitegen/target-pgo-gen/
+sitegen/target-pgo/

@@ -3,7 +3,7 @@
 use crate::json::J;
 use crate::md;
 use crate::text::*;
-use crate::tpl::{self, obj, s, st, Frame, Node, Str, V};
+use crate::tpl::{self, obj, s, st, st_json, Frame, Node, Str, V};
 
 use std::rc::Rc;
 
@@ -85,7 +85,7 @@ unsafe fn js_slug(p: *const u8, n: usize, out: *mut u8) -> usize {
         }
     }
     if slug.is_empty() {
-        slug.extend_from_slice(b"untitled");
+        slug.put(b"untitled");
     }
     std::ptr::copy_nonoverlapping(slug.as_ptr(), out, slug.len());
     slug.len()
@@ -379,7 +379,7 @@ impl<'o> Out<'o> {
         self.first = false;
         self.out.push(b'"');
         json_into(self.out, key);
-        self.out.extend_from_slice(b"\":\"");
+        self.out.put(b"\":\"");
         self.keys.insert(key.to_vec());
     }
     fn close(&mut self) {
@@ -388,7 +388,25 @@ impl<'o> Out<'o> {
 }
 
 /// Builds one site into `out`; false when it is input this build does not take exactly (out is then left to be cut).
+#[cfg(feature = "timing")]
+thread_local! { pub static PHASES: std::cell::RefCell<Vec<(&'static str, std::time::Duration)>> = const { std::cell::RefCell::new(Vec::new()) }; }
+
+/// Under the timing feature, the time since the last phase, kept as `name`'s.
+macro_rules! phase {
+    ($t:ident, $name:expr) => {
+        #[cfg(feature = "timing")]
+        {
+            let now = std::time::Instant::now();
+            PHASES.with(|p| p.borrow_mut().push(($name, now - $t)));
+            $t = now;
+        }
+    };
+}
+
 pub fn run(inp: &Input, out: &mut Vec<u8>) -> bool {
+    #[cfg(feature = "timing")]
+    #[allow(unused_mut)]
+    let mut t0 = std::time::Instant::now();
     let mut slugs = Slugs::default();
     let mut report: Vec<Vec<u8>> = Vec::new();
 
@@ -473,6 +491,7 @@ pub fn run(inp: &Input, out: &mut Vec<u8>) -> bool {
         kept.push(Src { path, text, body_at, fm, post, layout, slug: Vec::new(), out_dir: Vec::new(), url: st(b"") });
     }
 
+    phase!(t0, "sources+fm");
     // 3. Permalinks.
     let mut taken: Map<Vec<u8>, Set<Vec<u8>>> = Map::default();
     let mut by_source: Map<&[u8], usize> = Map::default();
@@ -489,6 +508,7 @@ pub fn run(inp: &Input, out: &mut Vec<u8>) -> bool {
         by_source.insert(s.path, k);
     }
 
+    phase!(t0, "permalinks");
     // 4. Markdown, links resolved.
     let static_paths: Set<&[u8]> = statics.iter().map(|f| f.0).collect();
     let mut broken: Vec<Vec<u8>> = Vec::new();
@@ -524,6 +544,10 @@ pub fn run(inp: &Input, out: &mut Vec<u8>) -> bool {
         let mut slug = |t: &[u8]| slugify_raw(t);
         mds.push(md::render(s.body(), &mut link, &mut slug));
     }
+
+    phase!(t0, "markdown");
+    // Each body's HTML and excerpt as the strings templates see, moved there (no copy).
+    let md_strs: Vec<(Str, Str)> = mds.iter_mut().map(|m| (st_json(std::mem::take(&mut m.html)), st_json(std::mem::take(&mut m.excerpt)))).collect();
 
     // 5. Posts, newest first then by slug.
     let mut posts: Vec<usize> = (0..kept.len()).filter(|&k| kept[k].post).collect();
@@ -587,6 +611,7 @@ pub fn run(inp: &Input, out: &mut Vec<u8>) -> bool {
     let mut tag_list: Vec<usize> = (0..tags.len()).collect();
     tag_list.sort_by(|&x, &y| tags[y].posts.len().cmp(&tags[x].posts.len()).then_with(|| cmp_units(&tags[x].slug.b, &tags[y].slug.b)));
 
+    phase!(t0, "posts+tags");
     // 7. Layouts.
     let empty = s(b"");
     let date_of = |k: usize| -> (V, V) {
@@ -612,7 +637,7 @@ pub fn run(inp: &Input, out: &mut Vec<u8>) -> bool {
             (tpl::K_DATE, date),
             (tpl::K_DATE_LONG, date_long),
             (tpl::K_SUMMARY, src.fm.summary.as_deref().map(s).unwrap_or_else(|| empty.clone())),
-            (tpl::K_EXCERPT, s(&mds[k].excerpt)),
+            (tpl::K_EXCERPT, V::Str(md_strs[k].1.clone())),
             (tpl::K_READING_MINUTES, V::Num(minutes as i64)),
             (tpl::K_TAGS, V::Arr(Rc::new(card_tags))),
         ]
@@ -643,13 +668,15 @@ pub fn run(inp: &Input, out: &mut Vec<u8>) -> bool {
         }
     };
 
+    phase!(t0, "cards");
+    let ctx = tpl::Ctx::new(&templates);
     let mut w = Out { out, first: true, keys: Set::default() };
     let render_top = |w: &mut Out, key: &[u8], name: &[u8], extra: Vec<(u32, V)>| {
         let t = &templates[name];
-        let mut vars: Vec<(u32, V)> = vec![(tpl::K_SITE, site.clone()), (tpl::K_TAGS, all_tags.clone()), (tpl::K_RECENT, recent.clone())];
-        vars.extend(extra);
+        let mut vars: Vec<(u32, &V)> = vec![(tpl::K_SITE, &site), (tpl::K_TAGS, &all_tags), (tpl::K_RECENT, &recent)];
+        vars.extend(extra.iter().map(|(k, v)| (*k, v)));
         w.open(key);
-        tpl::render(t, &Frame { vars: &vars, parent: None }, &templates, 0, w.out);
+        tpl::render(t, &Frame { vars: &vars, parent: None }, &ctx, 0, w.out);
         w.close();
     };
     for k in 0..kept.len() {
@@ -661,10 +688,10 @@ pub fn run(inp: &Input, out: &mut Vec<u8>) -> bool {
         let toc = mds[k]
             .toc
             .iter()
-            .map(|(level, id, html)| obj(vec![(tpl::K_LEVEL, V::Num(*level as i64)), (tpl::K_ID, s(id)), (tpl::K_HTML, s(html))]))
+            .map(|(level, id, html)| obj(vec![(tpl::K_LEVEL, V::Num(*level as i64)), (tpl::K_ID, s(id)), (tpl::K_HTML, V::Str(st_json(html.clone())))]))
             .collect();
         fields.push((tpl::K_SLUG, s(&src.slug)));
-        fields.push((tpl::K_CONTENT, s(&mds[k].html)));
+        fields.push((tpl::K_CONTENT, V::Str(md_strs[k].0.clone())));
         fields.push((tpl::K_TOC, V::Arr(Rc::new(toc))));
         fields.push((tpl::K_NEWER, link_of(newer[k])));
         fields.push((tpl::K_OLDER, link_of(older[k])));
@@ -672,6 +699,7 @@ pub fn run(inp: &Input, out: &mut Vec<u8>) -> bool {
         let key = [&src.out_dir[..], b"/index.html"].concat();
         render_top(&mut w, &key, &src.layout, vec![(tpl::K_PAGE, obj(fields))]);
     }
+    phase!(t0, "pages");
     let per = inp.per_page;
     let pages = posts.len().div_ceil(per).max(1);
     let index_url = |k: usize| -> V {
@@ -714,6 +742,7 @@ pub fn run(inp: &Input, out: &mut Vec<u8>) -> bool {
     if templates.contains_key(&b"tags"[..]) {
         render_top(&mut w, b"tags/index.html", b"tags", Vec::new());
     }
+    phase!(t0, "index+tags");
     for f in &statics {
         let path = f.0;
         // JavaScript puts array-index keys first and would overwrite a static build-report.txt in place: not taken here.
@@ -729,6 +758,7 @@ pub fn run(inp: &Input, out: &mut Vec<u8>) -> bool {
         }
     }
 
+    phase!(t0, "statics");
     // 8. The report.
     let mut lines: Vec<Vec<u8>> = report;
     lines.extend(broken);
@@ -743,5 +773,10 @@ pub fn run(inp: &Input, out: &mut Vec<u8>) -> bool {
     json_into(w.out, &text);
     w.close();
     w.out.push(b'}');
+    phase!(t0, "report");
+    // The case's memory goes back to the arena whole when it is done (see lib.rs), so its values are not dropped one
+    // by one.
+    std::mem::forget(ctx);
+    std::mem::forget((w, cards, md_strs, mds, tags, tag_refs, site, all_tags, recent, kept, templates, by_slug, slugs));
     true
 }

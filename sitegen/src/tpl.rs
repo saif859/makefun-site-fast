@@ -96,12 +96,28 @@ pub struct S {
     pub b: Vec<u8>,
     html_json: OnceCell<Vec<u8>>,
     json: OnceCell<Vec<u8>>,
+    /// Times written so far: the first write escapes straight into the output (a page's content is written once);
+    /// the escaped form is kept from the second on.
+    uses: std::cell::Cell<u32>,
+    /// Whether b is already the inside of a JSON string (Markdown's HTML): written as it is, its text made only
+    /// for an HTML-escaped write.
+    is_json: bool,
 }
 
 pub type Str = Rc<S>;
 
 pub fn st(b: &[u8]) -> Str {
-    Rc::new(S { b: b.to_vec(), html_json: OnceCell::new(), json: OnceCell::new() })
+    st_vec(b.to_vec())
+}
+
+/// A string templates see, taking the bytes as they are (no copy).
+pub fn st_vec(b: Vec<u8>) -> Str {
+    Rc::new(S { b, html_json: OnceCell::new(), json: OnceCell::new(), uses: std::cell::Cell::new(0), is_json: false })
+}
+
+/// A string templates see whose bytes are already the inside of a JSON string.
+pub fn st_json(b: Vec<u8>) -> Str {
+    Rc::new(S { b, html_json: OnceCell::new(), json: OnceCell::new(), uses: std::cell::Cell::new(0), is_json: true })
 }
 
 pub fn s(b: &[u8]) -> V {
@@ -113,7 +129,7 @@ pub fn obj(fields: Vec<(u32, V)>) -> V {
 }
 
 pub struct Frame<'a> {
-    pub vars: &'a [(u32, V)],
+    pub vars: &'a [(u32, &'a V)],
     pub parent: Option<&'a Frame<'a>>,
 }
 
@@ -135,7 +151,7 @@ fn path_of(name: &[u8], text: &[u8], keys: &mut Keys) -> Result<Vec<u32>, Vec<u8
     if !ok {
         let mut m = b"\"".to_vec();
         json_into(&mut m, text);
-        m.extend_from_slice(b"\" is not a path");
+        m.put(b"\" is not a path");
         return Err(err(name, &m));
     }
     Ok(text.split(|&c| c == b'.').map(|seg| keys.id(seg)).collect())
@@ -221,21 +237,21 @@ pub fn parse(name: &[u8], src: &[u8], keys: &mut Keys) -> Result<Vec<Node>, Vec<
         let open = match find_byte(&src[i..], b'{') {
             Some(o) => i + o,
             None => {
-                text.extend_from_slice(&src[i..]);
+                text.put(&src[i..]);
                 break;
             }
         };
         if open == n - 1 {
-            text.extend_from_slice(&src[i..]);
+            text.put(&src[i..]);
             break;
         }
         let next = src[open + 1];
         if next != b'{' && next != b'%' {
-            text.extend_from_slice(&src[i..open + 1]);
+            text.put(&src[i..open + 1]);
             i = open + 1;
             continue;
         }
-        text.extend_from_slice(&src[i..open]);
+        text.put(&src[i..open]);
         if next == b'{' {
             let raw = src.get(open + 2) == Some(&b'{');
             let from = open + if raw { 3 } else { 2 };
@@ -320,29 +336,41 @@ pub fn parse(name: &[u8], src: &[u8], keys: &mut Keys) -> Result<Vec<Node>, Vec<
     Ok(root)
 }
 
-fn walk(v: &V, keys: &[u32]) -> V {
-    let mut v = v.clone();
-    for &k in keys {
-        v = match &v {
-            V::Obj(o) => match o.iter().find(|(kk, _)| *kk == k) {
-                Some((_, x)) => x.clone(),
-                None => return V::Null,
-            },
-            V::Arr(a) if k == K_LENGTH => V::Num(a.len() as i64),
-            V::Loop(i, n) => match k {
-                K_INDEX => V::Num(*i as i64 + 1),
-                K_FIRST => V::Bool(*i == 0),
-                K_LAST => V::Bool(*i + 1 == *n),
-                K_LENGTH => V::Num(*n as i64),
-                _ => return V::Null,
-            },
-            _ => return V::Null,
-        };
-    }
-    v
+/// A value looked up: borrowed where it is kept, or made where a rule makes it (an array's length, a loop field).
+enum Got<'a> {
+    Ref(&'a V),
+    Num(i64),
+    Bool(bool),
+    Null,
 }
 
-fn lookup(f: &Frame, path: &[u32]) -> V {
+fn walk<'a>(v: &'a V, keys: &[u32]) -> Got<'a> {
+    let mut v = v;
+    for (i, &k) in keys.iter().enumerate() {
+        let last = i + 1 == keys.len();
+        match v {
+            V::Obj(o) => match o.iter().find(|(kk, _)| *kk == k) {
+                Some((_, x)) => v = x,
+                None => return Got::Null,
+            },
+            V::Arr(a) if k == K_LENGTH => return if last { Got::Num(a.len() as i64) } else { Got::Null },
+            V::Loop(j, n) => {
+                let g = match k {
+                    K_INDEX => Got::Num(*j as i64 + 1),
+                    K_FIRST => Got::Bool(*j == 0),
+                    K_LAST => Got::Bool(*j + 1 == *n),
+                    K_LENGTH => Got::Num(*n as i64),
+                    _ => Got::Null,
+                };
+                return if last { g } else { Got::Null };
+            }
+            _ => return Got::Null,
+        }
+    }
+    Got::Ref(v)
+}
+
+fn lookup<'a>(f: &Frame<'a>, path: &[u32]) -> Got<'a> {
     let head = path[0];
     let mut cur = Some(f);
     while let Some(fr) = cur {
@@ -351,24 +379,68 @@ fn lookup(f: &Frame, path: &[u32]) -> V {
         }
         cur = fr.parent;
     }
-    V::Null
+    Got::Null
 }
 
-fn truthy(v: &V) -> bool {
-    match v {
-        V::Null => false,
-        V::Bool(b) => *b,
-        V::Num(n) => *n != 0,
-        V::Str(s) => !s.b.is_empty(),
-        V::Arr(a) => !a.is_empty(),
-        V::Obj(_) | V::Loop(..) => true,
+fn truthy(g: &Got) -> bool {
+    match g {
+        Got::Null => false,
+        Got::Bool(b) => *b,
+        Got::Num(n) => *n != 0,
+        Got::Ref(v) => match v {
+            V::Null => false,
+            V::Bool(b) => *b,
+            V::Num(n) => *n != 0,
+            V::Str(s) => !s.b.is_empty(),
+            V::Arr(a) => !a.is_empty(),
+            V::Obj(_) | V::Loop(..) => true,
+        },
     }
+}
+
+fn emit_num(n: i64, out: &mut Vec<u8>) {
+    let mut buf = [0u8; 20];
+    let mut k = buf.len();
+    let mut x = n.unsigned_abs();
+    loop {
+        k -= 1;
+        buf[k] = b'0' + (x % 10) as u8;
+        x /= 10;
+        if x == 0 {
+            break;
+        }
+    }
+    if n < 0 {
+        out.push(b'-');
+    }
+    out.put(&buf[k..]);
 }
 
 /// textOf(v), HTML-escaped when `html`, as the inside of a JSON string.
 fn emit(v: &V, out: &mut Vec<u8>, html: bool) {
     match v {
+        V::Str(s) if s.is_json => {
+            if html {
+                out.put(s.html_json.get_or_init(|| {
+                    let mut e = Vec::with_capacity(s.b.len());
+                    html_json_into(&mut e, &json_unescape(&s.b));
+                    e
+                }));
+            } else {
+                out.put(&s.b);
+            }
+        }
         V::Str(s) => {
+            let cached = if html { s.html_json.get().is_some() } else { s.json.get().is_some() };
+            if !cached && s.uses.get() == 0 {
+                s.uses.set(1);
+                if html {
+                    html_json_into(out, &s.b);
+                } else {
+                    json_into(out, &s.b);
+                }
+                return;
+            }
             let e = if html {
                 s.html_json.get_or_init(|| {
                     let mut e = Vec::with_capacity(s.b.len());
@@ -382,30 +454,14 @@ fn emit(v: &V, out: &mut Vec<u8>, html: bool) {
                     e
                 })
             };
-            out.extend_from_slice(e);
+            out.put(e);
         }
-        V::Num(n) => {
-            let mut buf = [0u8; 20];
-            let mut k = buf.len();
-            let mut x = n.unsigned_abs();
-            loop {
-                k -= 1;
-                buf[k] = b'0' + (x % 10) as u8;
-                x /= 10;
-                if x == 0 {
-                    break;
-                }
-            }
-            if *n < 0 {
-                out.push(b'-');
-            }
-            out.extend_from_slice(&buf[k..]);
-        }
-        V::Bool(b) => out.extend_from_slice(if *b { b"true" } else { b"false" }),
+        V::Num(n) => emit_num(*n, out),
+        V::Bool(b) => out.put(if *b { b"true" } else { b"false" }),
         V::Arr(a) => {
             for (k, x) in a.iter().enumerate() {
                 if k > 0 {
-                    out.extend_from_slice(b", ");
+                    out.put(b", ");
                 }
                 emit(x, out, html);
             }
@@ -414,44 +470,187 @@ fn emit(v: &V, out: &mut Vec<u8>, html: bool) {
     }
 }
 
+fn emit_got(g: &Got, out: &mut Vec<u8>, html: bool) {
+    match g {
+        Got::Ref(v) => emit(v, out, html),
+        Got::Num(n) => emit_num(*n, out),
+        Got::Bool(b) => out.put(if *b { b"true" } else { b"false" }),
+        Got::Null => {}
+    }
+}
+
 pub const INCLUDE_DEPTH: usize = 8;
 
-pub fn render(nodes: &[Node], f: &Frame, tpls: &Map<Vec<u8>, Vec<Node>>, depth: usize, out: &mut Vec<u8>) {
+/// The names a build gives every render alike.
+const GLOBALS: [u32; 3] = [K_SITE, K_TAGS, K_RECENT];
+
+/// The root names `nodes` read that they do not bind themselves (pushed to `out`): an include adds its template's
+/// (`inc`, a superset: names a loop around the include binds are taken off only where that loop is).
+fn free_of(nodes: &[Node], inc: &Map<Vec<u8>, Vec<u32>>, out: &mut Vec<u32>) {
     for n in nodes {
         match n {
-            Node::Text(t) => out.extend_from_slice(t),
-            Node::Var(p) => emit(&lookup(f, p), out, true),
-            Node::Raw(p) => emit(&lookup(f, p), out, false),
-            Node::If(not, path, then, els) => {
-                if truthy(&lookup(f, path)) != *not {
-                    render(then, f, tpls, depth, out);
-                } else if let Some(e) = els {
-                    render(e, f, tpls, depth, out);
+            Node::Text(_) => {}
+            Node::Var(p) | Node::Raw(p) => out.push(p[0]),
+            Node::If(_, p, then, els) => {
+                out.push(p[0]);
+                free_of(then, inc, out);
+                if let Some(e) = els {
+                    free_of(e, inc, out);
                 }
             }
-            Node::For(name, path, body) => {
-                if let V::Arr(xs) = lookup(f, path) {
+            Node::For(name, p, body) => {
+                out.push(p[0]);
+                let mut b = Vec::new();
+                free_of(body, inc, &mut b);
+                out.extend(b.into_iter().filter(|k| *k != *name && *k != K_LOOP));
+            }
+            Node::Include(t) => {
+                if let Some(f) = inc.get(t) {
+                    out.extend(f.iter().copied());
+                }
+            }
+        }
+    }
+}
+
+/// The include and for nodes whose output reads nothing but the build-wide names (site, tags, recent): by address.
+pub fn constants(tpls: &Map<Vec<u8>, Vec<Node>>) -> Set<usize> {
+    let mut free: Map<Vec<u8>, Vec<u32>> = tpls.keys().map(|k| (k.clone(), Vec::new())).collect();
+    loop {
+        let mut changed = false;
+        for (name, nodes) in tpls {
+            let mut f = Vec::new();
+            free_of(nodes, &free, &mut f);
+            f.sort_unstable();
+            f.dedup();
+            if free[name] != f {
+                free.insert(name.clone(), f);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut out = Set::default();
+    fn visit(nodes: &[Node], free: &Map<Vec<u8>, Vec<u32>>, out: &mut Set<usize>) {
+        for n in nodes {
+            match n {
+                Node::If(_, _, then, els) => {
+                    visit(then, free, out);
+                    if let Some(e) = els {
+                        visit(e, free, out);
+                    }
+                }
+                Node::For(_, _, body) => {
+                    let mut f = Vec::new();
+                    free_of(std::slice::from_ref(n), free, &mut f);
+                    if f.iter().all(|k| GLOBALS.contains(k)) {
+                        out.insert(n as *const Node as usize);
+                    }
+                    visit(body, free, out);
+                }
+                Node::Include(t) => {
+                    if free.get(t).is_some_and(|f| f.iter().all(|k| GLOBALS.contains(k))) {
+                        out.insert(n as *const Node as usize);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    for nodes in tpls.values() {
+        visit(nodes, &free, &mut out);
+    }
+    out
+}
+
+/// What a build's renders share: its templates, the nodes whose output is the same in every render (at one include
+/// depth) and that output once made, kept in `buf`.
+pub struct Ctx<'t> {
+    pub tpls: &'t Map<Vec<u8>, Vec<Node>>,
+    pub constant: Set<usize>,
+    cache: std::cell::RefCell<Map<(usize, usize), (usize, usize)>>,
+    buf: std::cell::RefCell<Vec<u8>>,
+}
+
+impl<'t> Ctx<'t> {
+    pub fn new(tpls: &'t Map<Vec<u8>, Vec<Node>>) -> Ctx<'t> {
+        Ctx { tpls, constant: constants(tpls), cache: Default::default(), buf: Default::default() }
+    }
+}
+
+/// Whether a frame below the render's own top one binds a build-wide name (a loop variable named site, say).
+fn shadowed(f: &Frame) -> bool {
+    let mut cur = Some(f);
+    while let Some(fr) = cur {
+        if fr.parent.is_none() {
+            return false;
+        }
+        if fr.vars.iter().any(|(k, _)| GLOBALS.contains(k)) {
+            return true;
+        }
+        cur = fr.parent;
+    }
+    false
+}
+
+/// Node n's output (by `make`), from the cache when n is a constant one already made at this depth.
+fn cached(n: &Node, f: &Frame, ctx: &Ctx, depth: usize, out: &mut Vec<u8>, make: impl FnOnce(&mut Vec<u8>)) {
+    let at = n as *const Node as usize;
+    if !ctx.constant.contains(&at) || shadowed(f) {
+        make(out);
+        return;
+    }
+    if let Some(&(a, b)) = ctx.cache.borrow().get(&(at, depth)) {
+        out.put(&ctx.buf.borrow()[a..b]);
+        return;
+    }
+    let start = out.len();
+    make(out);
+    let mut buf = ctx.buf.borrow_mut();
+    let a = buf.len();
+    buf.extend_from_slice(&out[start..]);
+    let b = buf.len();
+    ctx.cache.borrow_mut().insert((at, depth), (a, b));
+}
+
+pub fn render(nodes: &[Node], f: &Frame, ctx: &Ctx, depth: usize, out: &mut Vec<u8>) {
+    for n in nodes {
+        match n {
+            Node::Text(t) => out.put(t),
+            Node::Var(p) => emit_got(&lookup(f, p), out, true),
+            Node::Raw(p) => emit_got(&lookup(f, p), out, false),
+            Node::If(not, path, then, els) => {
+                if truthy(&lookup(f, path)) != *not {
+                    render(then, f, ctx, depth, out);
+                } else if let Some(e) = els {
+                    render(e, f, ctx, depth, out);
+                }
+            }
+            Node::For(name, path, body) => cached(n, f, ctx, depth, out, |out| {
+                if let Got::Ref(V::Arr(xs)) = lookup(f, path) {
                     let len = xs.len() as u32;
                     for (k, x) in xs.iter().enumerate() {
                         let rec = V::Loop(k as u32, len);
                         let pair;
                         let one;
-                        let vars: &[(u32, V)] = if *name == K_LOOP {
-                            one = [(K_LOOP, rec)];
+                        let vars: &[(u32, &V)] = if *name == K_LOOP {
+                            one = [(K_LOOP, &rec)];
                             &one
                         } else {
-                            pair = [(*name, x.clone()), (K_LOOP, rec)];
+                            pair = [(*name, x), (K_LOOP, &rec)];
                             &pair
                         };
                         let fr = Frame { vars, parent: Some(f) };
-                        render(body, &fr, tpls, depth, out);
+                        render(body, &fr, ctx, depth, out);
                     }
                 }
-            }
+            }),
             Node::Include(name) => {
                 if depth < INCLUDE_DEPTH {
-                    if let Some(t) = tpls.get(name) {
-                        render(t, f, tpls, depth + 1, out);
+                    if let Some(t) = ctx.tpls.get(name) {
+                        cached(n, f, ctx, depth, out, |out| render(t, f, ctx, depth + 1, out));
                     }
                 }
             }

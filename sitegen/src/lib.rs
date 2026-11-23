@@ -3,7 +3,7 @@
 //! in JavaScript instead, and slugs of non-ASCII text call back into JavaScript for its NFKD (js_slug). As a Linux
 //! program (main.rs), it builds the whole answers file or none of it.
 
-mod build;
+pub mod build;
 mod json;
 mod md;
 mod text;
@@ -139,12 +139,12 @@ pub extern "C" fn alloc(n: usize) -> *mut u8 {
     p
 }
 
-/// Builds every case of the cases.json held in the n bytes at p: the case count, or -1 for a file this build does
+/// Builds every case of the cases.json held in the n bytes at p (unescaped in place as it is read): the case count, or -1 for a file this build does
 /// not read. Each case's answer (its JSON object) is then out_ptr()[case_info(i, 1)..case_info(i, 2)], when
 /// case_info(i, 0) is 1; 0 marks a case left to JavaScript.
 #[no_mangle]
-pub extern "C" fn build(p: *const u8, n: usize) -> i32 {
-    let src = unsafe { std::slice::from_raw_parts(p, n) };
+pub extern "C" fn build(p: *mut u8, n: usize) -> i32 {
+    let src = unsafe { std::slice::from_raw_parts_mut(p, n) };
     let Some(inputs) = json::parse_cases(src) else { return -1 };
     let mut out = Vec::with_capacity(n * 3);
     let mut cases = Vec::with_capacity(inputs.len());
@@ -164,12 +164,21 @@ pub extern "C" fn build(p: *const u8, n: usize) -> i32 {
 
 /// The answers file (the JSON array of every case's answer) when this build takes every case of cases.json exactly,
 /// else None: valid UTF-8 with no U+2028 or U+2029 (which a regex "." stops at), as main.js's one-byte check asks.
-pub fn build_all(src: &[u8]) -> Option<Vec<u8>> {
-    if std::str::from_utf8(src).is_err() || src.windows(3).any(|w| w[0] == 0xe2 && w[1] == 0x80 && (w[2] == 0xa8 || w[2] == 0xa9)) {
+pub fn build_all(src: &mut [u8]) -> Option<Vec<u8>> {
+    if std::str::from_utf8(src).is_err() {
         return None;
     }
+    let mut at = 0;
+    while let Some(k) = text::find_byte(&src[at..], 0xe2) {
+        let i = at + k;
+        if src.get(i + 1) == Some(&0x80) && matches!(src.get(i + 2), Some(&0xa8) | Some(&0xa9)) {
+            return None;
+        }
+        at = i + 1;
+    }
+    let n = src.len();
     let inputs = json::parse_cases(src)?;
-    let mut out = Vec::with_capacity(src.len() * 3 + 2);
+    let mut out = Vec::with_capacity(n * 3 + 2);
     out.push(b'[');
     for (k, j) in inputs.iter().enumerate() {
         if k > 0 {
@@ -192,3 +201,6 @@ pub extern "C" fn out_ptr() -> *const u8 {
 pub extern "C" fn case_info(i: usize, k: usize) -> u32 {
     CASES.with(|c| c.borrow()[i][k])
 }
+
+#[cfg(feature = "timing")]
+pub use build::PHASES;

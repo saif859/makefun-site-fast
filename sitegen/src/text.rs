@@ -21,8 +21,25 @@ pub fn is_escapable(c: u8) -> bool {
     c < 128 && ESCAPABLE[c as usize]
 }
 
+/// The first b in s: eight bytes at a time (the lowest flagged byte of a word is always a true one).
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
 pub fn find_byte(s: &[u8], b: u8) -> Option<usize> {
-    s.iter().position(|&c| c == b)
+    let mut i = 0;
+    while i + 8 <= s.len() {
+        let m = bytes_eq(u64::from_le_bytes(s[i..i + 8].try_into().unwrap()), b);
+        if m != 0 {
+            return Some(i + (m.trailing_zeros() / 8) as usize);
+        }
+        i += 8;
+    }
+    while i < s.len() {
+        if s[i] == b {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
 
 pub fn find_bytes(s: &[u8], pat: &[u8], from: usize) -> Option<usize> {
@@ -33,7 +50,7 @@ pub fn find_bytes(s: &[u8], pat: &[u8], from: usize) -> Option<usize> {
 }
 
 #[inline]
-fn entity(c: u8) -> Option<&'static [u8]> {
+pub fn entity(c: u8) -> Option<&'static [u8]> {
     match c {
         b'&' => Some(b"&amp;"),
         b'<' => Some(b"&lt;"),
@@ -61,6 +78,12 @@ const fn class_table() -> [u8; 256] {
         i += 1;
     }
     let md = b"\\`*[";
+    // Inline Markdown also stops at control characters (its output is the inside of a JSON string).
+    let mut c = 0;
+    while c < 0x20 {
+        t[c] |= 4;
+        c += 1;
+    }
     let mut i = 0;
     while i < md.len() {
         t[md[i] as usize] |= 4;
@@ -69,6 +92,69 @@ const fn class_table() -> [u8; 256] {
     t
 }
 pub const CLASS: [u8; 256] = class_table();
+
+/// Appending bytes: runs of up to 32 bytes (almost all of them: text between escapes, entities, markup) are copied
+/// inline with two overlapping loads and stores, up to 256 in 16-byte steps, longer ones by memcpy (musl's costs
+/// more to call than a short copy takes).
+pub trait Put {
+    fn put(&mut self, s: &[u8]);
+}
+
+impl Put for Vec<u8> {
+    #[inline(always)]
+    fn put(&mut self, s: &[u8]) {
+        let n = s.len();
+        if n > 32 {
+            if n > 256 {
+                self.extend_from_slice(s);
+                return;
+            }
+            self.reserve(n);
+            unsafe {
+                let d = self.as_mut_ptr().add(self.len());
+                let p = s.as_ptr();
+                let mut k = 0;
+                while k + 16 < n {
+                    (d.add(k) as *mut [u8; 16]).write_unaligned((p.add(k) as *const [u8; 16]).read_unaligned());
+                    k += 16;
+                }
+                (d.add(n - 16) as *mut [u8; 16]).write_unaligned((p.add(n - 16) as *const [u8; 16]).read_unaligned());
+                self.set_len(self.len() + n);
+            }
+            return;
+        }
+        self.reserve(n);
+        unsafe {
+            let d = self.as_mut_ptr().add(self.len());
+            let p = s.as_ptr();
+            if n >= 16 {
+                let a = (p as *const [u8; 16]).read_unaligned();
+                let b = (p.add(n - 16) as *const [u8; 16]).read_unaligned();
+                (d as *mut [u8; 16]).write_unaligned(a);
+                (d.add(n - 16) as *mut [u8; 16]).write_unaligned(b);
+            } else if n >= 8 {
+                let a = (p as *const u64).read_unaligned();
+                let b = (p.add(n - 8) as *const u64).read_unaligned();
+                (d as *mut u64).write_unaligned(a);
+                (d.add(n - 8) as *mut u64).write_unaligned(b);
+            } else if n >= 4 {
+                let a = (p as *const u32).read_unaligned();
+                let b = (p.add(n - 4) as *const u32).read_unaligned();
+                (d as *mut u32).write_unaligned(a);
+                (d.add(n - 4) as *mut u32).write_unaligned(b);
+            } else if n > 0 {
+                *d = *p;
+                if n > 1 {
+                    *d.add(1) = *p.add(1);
+                    if n > 2 {
+                        *d.add(2) = *p.add(2);
+                    }
+                }
+            }
+            self.set_len(self.len() + n);
+        }
+    }
+}
 
 const LO: u64 = 0x0101_0101_0101_0101;
 const HI: u64 = 0x8080_8080_8080_8080;
@@ -82,6 +168,7 @@ fn bytes_eq(w: u64, c: u8) -> u64 {
 
 /// The first index from i of a byte in `set` (or below 0x20, with `ctl`), or s.len(): eight bytes at a time while
 /// none is there, then byte by byte on CLASS bit `bit`, which marks the same bytes.
+#[cfg(not(target_arch = "x86_64"))]
 #[inline(always)]
 pub fn scan<const N: usize>(s: &[u8], mut i: usize, set: [u8; N], ctl: bool, bit: u8) -> usize {
     while i + 8 <= s.len() {
@@ -91,7 +178,8 @@ pub fn scan<const N: usize>(s: &[u8], mut i: usize, set: [u8; N], ctl: bool, bit
             m |= bytes_eq(w, c);
         }
         if m != 0 {
-            break;
+            // Every test flags its first match exactly (false flags only come after a true one): the lowest is it.
+            return i + (m.trailing_zeros() / 8) as usize;
         }
         i += 8;
     }
@@ -116,10 +204,10 @@ fn next_html_json(s: &[u8], i: usize) -> usize {
     scan(s, i, [b'&', b'<', b'>', b'"', b'\'', b'\\'], true, 3)
 }
 
-/// The next byte inline Markdown acts on or escaping changes (& < > " ' \ ` * [).
+/// The next byte inline Markdown acts on or escaping changes (& < > " ' \ ` * [ and control characters).
 #[inline(always)]
 pub fn next_inline(s: &[u8], i: usize) -> usize {
-    scan(s, i, [b'&', b'<', b'>', b'"', b'\'', b'\\', b'`', b'*', b'['], false, 4)
+    scan(s, i, [b'&', b'<', b'>', b'"', b'\'', b'\\', b'`', b'*', b'['], true, 4)
 }
 
 /// s with & < > " and ' escaped, appended to out.
@@ -127,27 +215,27 @@ pub fn esc_into(out: &mut Vec<u8>, s: &[u8]) {
     let mut run = 0;
     let mut i = next_html(s, 0);
     while i < s.len() {
-        out.extend_from_slice(&s[run..i]);
-        out.extend_from_slice(entity(s[i]).unwrap());
+        out.put(&s[run..i]);
+        out.put(entity(s[i]).unwrap());
         run = i + 1;
         i = next_html(s, i + 1);
     }
-    out.extend_from_slice(&s[run..]);
+    out.put(&s[run..]);
 }
 
 #[inline]
-fn json_escape(out: &mut Vec<u8>, c: u8) {
+pub fn json_escape(out: &mut Vec<u8>, c: u8) {
     match c {
-        b'"' => out.extend_from_slice(b"\\\""),
-        b'\\' => out.extend_from_slice(b"\\\\"),
-        b'\n' => out.extend_from_slice(b"\\n"),
-        b'\r' => out.extend_from_slice(b"\\r"),
-        b'\t' => out.extend_from_slice(b"\\t"),
-        8 => out.extend_from_slice(b"\\b"),
-        12 => out.extend_from_slice(b"\\f"),
+        b'"' => out.put(b"\\\""),
+        b'\\' => out.put(b"\\\\"),
+        b'\n' => out.put(b"\\n"),
+        b'\r' => out.put(b"\\r"),
+        b'\t' => out.put(b"\\t"),
+        8 => out.put(b"\\b"),
+        12 => out.put(b"\\f"),
         _ => {
             const H: &[u8; 16] = b"0123456789abcdef";
-            out.extend_from_slice(b"\\u00");
+            out.put(b"\\u00");
             out.push(H[(c >> 4) as usize]);
             out.push(H[(c & 15) as usize]);
         }
@@ -160,12 +248,12 @@ pub fn json_into(out: &mut Vec<u8>, s: &[u8]) {
     let mut run = 0;
     let mut i = next_json(s, 0);
     while i < s.len() {
-        out.extend_from_slice(&s[run..i]);
+        out.put(&s[run..i]);
         json_escape(out, s[i]);
         run = i + 1;
         i = next_json(s, i + 1);
     }
-    out.extend_from_slice(&s[run..]);
+    out.put(&s[run..]);
 }
 
 /// s HTML-escaped, then as the inside of a JSON string, appended to out.
@@ -175,16 +263,16 @@ pub fn html_json_into(out: &mut Vec<u8>, s: &[u8]) {
     let mut i = next_html_json(s, 0);
     while i < s.len() {
         let c = s[i];
-        out.extend_from_slice(&s[run..i]);
+        out.put(&s[run..i]);
         if CLASS[c as usize] & 1 != 0 {
-            out.extend_from_slice(entity(c).unwrap());
+            out.put(entity(c).unwrap());
         } else {
             json_escape(out, c);
         }
         run = i + 1;
         i = next_html_json(s, i + 1);
     }
-    out.extend_from_slice(&s[run..]);
+    out.put(&s[run..]);
 }
 
 /// A fast hash for the build's small maps and sets (FxHash: one multiply per 8 bytes).
@@ -317,6 +405,7 @@ fn lt_exact(w: u64, c: u8) -> u64 {
 
 /// The count of /\S+/g matches: eight bytes at a time (ASCII whitespace by mask, word starts by popcount) where no
 /// byte can start a non-ASCII \s character, byte by byte elsewhere.
+#[cfg(not(target_arch = "x86_64"))]
 pub fn words(s: &[u8]) -> usize {
     let mut n = 0;
     let mut in_word = false;
@@ -430,4 +519,154 @@ pub fn long_date(d: &[u8]) -> Vec<u8> {
     let day = num(&d[8..10]);
     let month = num(&d[5..7]);
     [day.to_string().as_bytes(), b" ", MONTHS[month - 1], b" ", &d[0..4]].concat()
+}
+
+// ---------------------------------------------------------------- x86-64: the same scans sixteen bytes at a time
+//
+// SSE2 is part of x86-64, so these need no feature test: a compare per byte of a set, the lanes' high bits gathered
+// into a mask, and its lowest set bit is the first match.
+
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
+
+/// The first b in s.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub fn find_byte(s: &[u8], b: u8) -> Option<usize> {
+    let mut i = 0;
+    unsafe {
+        let p = s.as_ptr();
+        let needle = _mm_set1_epi8(b as i8);
+        while i + 16 <= s.len() {
+            let m = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128(p.add(i) as *const __m128i), needle)) as u32;
+            if m != 0 {
+                return Some(i + m.trailing_zeros() as usize);
+            }
+            i += 16;
+        }
+    }
+    while i < s.len() {
+        if s[i] == b {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The first index from i of a byte in `set` (or below 0x20, with `ctl`), or s.len(); CLASS bit `bit` marks the
+/// same bytes for the tail.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub fn scan<const N: usize>(s: &[u8], mut i: usize, set: [u8; N], ctl: bool, bit: u8) -> usize {
+    unsafe {
+        let p = s.as_ptr();
+        let low = _mm_set1_epi8(0x1f);
+        while i + 16 <= s.len() {
+            let v = _mm_loadu_si128(p.add(i) as *const __m128i);
+            let mut m = if ctl { _mm_cmpeq_epi8(_mm_min_epu8(v, low), v) } else { _mm_setzero_si128() };
+            for c in set {
+                m = _mm_or_si128(m, _mm_cmpeq_epi8(v, _mm_set1_epi8(c as i8)));
+            }
+            let mask = _mm_movemask_epi8(m) as u32;
+            if mask != 0 {
+                return i + mask.trailing_zeros() as usize;
+            }
+            i += 16;
+        }
+    }
+    while i < s.len() && CLASS[s[i] as usize] & bit == 0 {
+        i += 1;
+    }
+    i
+}
+
+/// The count of /\S+/g matches: sixteen bytes at a time (ASCII whitespace by mask, word starts by popcount) where no
+/// byte can start a non-ASCII \s character, byte by byte elsewhere.
+#[cfg(target_arch = "x86_64")]
+pub fn words(s: &[u8]) -> usize {
+    let mut n = 0;
+    let mut in_word = false;
+    let mut i = 0;
+    unsafe {
+        let p = s.as_ptr();
+        let (space, nine, four) = (_mm_set1_epi8(b' ' as i8), _mm_set1_epi8(9), _mm_set1_epi8(4));
+        let leads = [0xc2u8, 0xe1, 0xe2, 0xe3, 0xef].map(|c| _mm_set1_epi8(c as i8));
+        while i < s.len() {
+            let mut end = s.len();
+            if i + 16 <= s.len() {
+                let v = _mm_loadu_si128(p.add(i) as *const __m128i);
+                let mut lead = 0;
+                if _mm_movemask_epi8(v) != 0 {
+                    let mut m = _mm_setzero_si128();
+                    for l in leads {
+                        m = _mm_or_si128(m, _mm_cmpeq_epi8(v, l));
+                    }
+                    lead = _mm_movemask_epi8(m);
+                }
+                if lead == 0 {
+                    // Whitespace: a space, or 9-13 (v - 9 at most 4, unsigned).
+                    let t = _mm_sub_epi8(v, nine);
+                    let ws = _mm_or_si128(_mm_cmpeq_epi8(v, space), _mm_cmpeq_epi8(_mm_min_epu8(t, four), t));
+                    let sp = _mm_movemask_epi8(ws) as u32;
+                    let prev = (sp << 1) | if in_word { 0 } else { 1 };
+                    n += (!sp & 0xffff & prev).count_ones() as usize;
+                    in_word = sp & 0x8000 == 0;
+                    i += 16;
+                    continue;
+                }
+                end = i + 16;
+            }
+            while i < end {
+                let c = s[i];
+                if c == b' ' || (9..=13).contains(&c) {
+                    in_word = false;
+                    i += 1;
+                    continue;
+                }
+                let w = if c >= 0xc2 { ws_at(s, i) } else { 0 };
+                if w > 0 {
+                    in_word = false;
+                    i += w;
+                } else {
+                    if !in_word {
+                        in_word = true;
+                        n += 1;
+                    }
+                    i += 1;
+                }
+            }
+        }
+    }
+    n
+}
+
+/// The text whose JSON-string inside is s (json_into undone).
+pub fn json_unescape(s: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len());
+    let mut i = 0;
+    while i < s.len() {
+        let c = s[i];
+        if c != b'\\' || i + 1 >= s.len() {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        let e = s[i + 1];
+        i += 2;
+        out.push(match e {
+            b'n' => b'\n',
+            b'r' => b'\r',
+            b't' => b'\t',
+            b'b' => 8,
+            b'f' => 12,
+            b'u' => {
+                let v = s.get(i..i + 4).and_then(|h| std::str::from_utf8(h).ok()).and_then(|h| u8::from_str_radix(&h[2..], 16).ok()).unwrap_or(0);
+                i += 4;
+                v
+            }
+            other => other,
+        });
+    }
+    out
 }

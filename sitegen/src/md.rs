@@ -160,7 +160,8 @@ fn find_single_star(s: &[u8], from: usize) -> Option<usize> {
     None
 }
 
-/// makefun-site's inline Markdown of raw text t, its text HTML-escaped, appended to out.
+/// makefun-site's inline Markdown of raw text t, its text HTML-escaped, appended to out as the inside of a
+/// JSON string.
 pub fn inline(t: &[u8], out: &mut Vec<u8>, link: &mut Link) {
     let n = t.len();
     let mut run = 0;
@@ -173,32 +174,47 @@ pub fn inline(t: &[u8], out: &mut Vec<u8>, link: &mut Link) {
         let c = t[i];
         match c {
             b'&' | b'<' | b'>' | b'"' | b'\'' => {
-                out.extend_from_slice(&t[run..i]);
-                esc_into(out, &t[i..i + 1]);
+                out.put(&t[run..i]);
+                out.put(entity(c).unwrap());
                 i += 1;
                 run = i;
             }
             b'\\' => {
+                out.put(&t[run..i]);
                 if i + 1 < n && is_escapable(t[i + 1]) {
-                    out.extend_from_slice(&t[run..i]);
-                    if t[i + 1] == b'>' {
-                        out.extend_from_slice(b"&gt;");
-                        run = i + 2;
-                    } else {
-                        run = i + 1;
+                    // The backslash goes; the character it escapes stays as text (">" as its entity, a backslash as
+                    // JSON writes one).
+                    match t[i + 1] {
+                        b'>' => {
+                            out.put(b"&gt;");
+                            run = i + 2;
+                        }
+                        b'\\' => {
+                            out.put(b"\\\\");
+                            run = i + 2;
+                        }
+                        _ => run = i + 1,
                     }
                     i += 2;
                 } else {
+                    out.put(b"\\\\");
                     i += 1;
+                    run = i;
                 }
+            }
+            0..=0x1f => {
+                out.put(&t[run..i]);
+                json_escape(out, c);
+                i += 1;
+                run = i;
             }
             b'`' => match find_byte(&t[i + 1..], b'`') {
                 Some(off) if off > 0 => {
                     let j = i + 1 + off;
-                    out.extend_from_slice(&t[run..i]);
-                    out.extend_from_slice(b"<code>");
-                    esc_into(out, &t[i + 1..j]);
-                    out.extend_from_slice(b"</code>");
+                    out.put(&t[run..i]);
+                    out.put(b"<code>");
+                    html_json_into(out, &t[i + 1..j]);
+                    out.put(b"</code>");
                     i = j + 1;
                     run = i;
                 }
@@ -208,10 +224,10 @@ pub fn inline(t: &[u8], out: &mut Vec<u8>, link: &mut Link) {
                 if i + 1 < n && t[i + 1] == b'*' {
                     match find_double(t, i + 2) {
                         Some(j) if j > i + 2 => {
-                            out.extend_from_slice(&t[run..i]);
-                            out.extend_from_slice(b"<strong>");
+                            out.put(&t[run..i]);
+                            out.put(b"<strong>");
                             inline(&t[i + 2..j], out, link);
-                            out.extend_from_slice(b"</strong>");
+                            out.put(b"</strong>");
                             i = j + 2;
                             run = i;
                         }
@@ -220,10 +236,10 @@ pub fn inline(t: &[u8], out: &mut Vec<u8>, link: &mut Link) {
                 } else {
                     match find_single_star(t, i + 1) {
                         Some(j) if j > i + 1 => {
-                            out.extend_from_slice(&t[run..i]);
-                            out.extend_from_slice(b"<em>");
+                            out.put(&t[run..i]);
+                            out.put(b"<em>");
                             inline(&t[i + 1..j], out, link);
-                            out.extend_from_slice(b"</em>");
+                            out.put(b"</em>");
                             i = j + 1;
                             run = i;
                         }
@@ -240,12 +256,12 @@ pub fn inline(t: &[u8], out: &mut Vec<u8>, link: &mut Link) {
                 if let (Some(k), Some(m)) = (k, m) {
                     if m > k + 2 && !has_space(&t[k + 2..m]) {
                         let href = link(&t[k + 2..m]);
-                        out.extend_from_slice(&t[run..i]);
-                        out.extend_from_slice(b"<a href=\"");
-                        esc_into(out, &href);
-                        out.extend_from_slice(b"\">");
+                        out.put(&t[run..i]);
+                        out.put(b"<a href=\\\"");
+                        html_json_into(out, &href);
+                        out.put(b"\\\">");
                         inline(&t[i + 1..k], out, link);
-                        out.extend_from_slice(b"</a>");
+                        out.put(b"</a>");
                         i = m + 1;
                         run = i;
                         continue;
@@ -256,10 +272,11 @@ pub fn inline(t: &[u8], out: &mut Vec<u8>, link: &mut Link) {
             _ => i += 1,
         }
     }
-    out.extend_from_slice(&t[run..]);
+    out.put(&t[run..]);
 }
 
-/// A source body rendered: its HTML, its h2 and h3 entries and its first paragraph's HTML.
+/// A source body rendered: its HTML, its h2 and h3 entries and its first paragraph's HTML, each as the inside of
+/// a JSON string (what the answer holds).
 pub fn render(src: &[u8], link: &mut Link, slug: &mut Slug) -> Md {
     let mut lines: Vec<(usize, usize)> = Vec::new();
     let mut p = 0;
@@ -301,18 +318,18 @@ pub fn render(src: &[u8], link: &mut Link, slug: &mut Slug) -> Md {
                     i += 1;
                 }
                 if lang.is_empty() {
-                    html.extend_from_slice(b"<pre><code>");
+                    html.put(b"<pre><code>");
                 } else {
-                    html.extend_from_slice(b"<pre><code class=\"language-");
-                    esc_into(&mut html, lang);
-                    html.extend_from_slice(b"\">");
+                    html.put(b"<pre><code class=\\\"language-");
+                    html_json_into(&mut html, lang);
+                    html.put(b"\\\">");
                 }
                 if i > first {
-                    esc_into(&mut html, &src[lines[first].0..lines[i - 1].1]);
-                    html.push(b'\n');
+                    html_json_into(&mut html, &src[lines[first].0..lines[i - 1].1]);
+                    html.put(b"\\n");
                 }
                 i += 1;
-                html.extend_from_slice(b"</code></pre>\n");
+                html.put(b"</code></pre>\\n");
                 continue;
             }
         }
@@ -320,25 +337,25 @@ pub fn render(src: &[u8], link: &mut Link, slug: &mut Slug) -> Md {
             if let Some((depth, text)) = heading(ln) {
                 let id = unique_slug(&slug(text), &mut ids);
                 let d = b'0' + depth as u8;
-                html.extend_from_slice(b"<h");
+                html.put(b"<h");
                 html.push(d);
-                html.extend_from_slice(b" id=\"");
-                html.extend_from_slice(&id);
-                html.extend_from_slice(b"\">");
+                html.put(b" id=\\\"");
+                html.put(&id);
+                html.put(b"\\\">");
                 let at = html.len();
                 inline(text, &mut html, link);
                 if depth == 2 || depth == 3 {
                     toc.push((depth as u8, id, html[at..].to_vec()));
                 }
-                html.extend_from_slice(b"</h");
+                html.put(b"</h");
                 html.push(d);
-                html.extend_from_slice(b">\n");
+                html.put(b">\\n");
                 i += 1;
                 continue;
             }
         }
         if (c0 == b'-' || c0 == b'*') && hr(ln) {
-            html.extend_from_slice(b"<hr>\n");
+            html.put(b"<hr>\\n");
             i += 1;
             continue;
         }
@@ -360,11 +377,11 @@ pub fn render(src: &[u8], link: &mut Link, slug: &mut Slug) -> Md {
                 i += 1;
             }
             if kept.is_empty() {
-                html.extend_from_slice(b"<blockquote>\n</blockquote>\n");
+                html.put(b"<blockquote>\\n</blockquote>\\n");
             } else {
-                html.extend_from_slice(b"<blockquote>\n<p>");
+                html.put(b"<blockquote>\\n<p>");
                 inline(&kept.join(&b'\n'), &mut html, link);
-                html.extend_from_slice(b"</p>\n</blockquote>\n");
+                html.put(b"</p>\\n</blockquote>\\n");
             }
             continue;
         }
@@ -376,14 +393,14 @@ pub fn render(src: &[u8], link: &mut Link, slug: &mut Slug) -> Md {
                 if let Some((digits, _)) = o {
                     let start = digits.iter().fold(0u64, |a, &c| a * 10 + (c - b'0') as u64);
                     if start != 1 {
-                        html.extend_from_slice(b"<ol start=\"");
-                        html.extend_from_slice(start.to_string().as_bytes());
-                        html.extend_from_slice(b"\">\n");
+                        html.put(b"<ol start=\\\"");
+                        html.put(start.to_string().as_bytes());
+                        html.put(b"\\\">\\n");
                     } else {
-                        html.extend_from_slice(b"<ol>\n");
+                        html.put(b"<ol>\\n");
                     }
                 } else {
-                    html.extend_from_slice(b"<ul>\n");
+                    html.put(b"<ul>\\n");
                 }
                 let mut cur: Option<Vec<u8>> = None;
                 while i < nl {
@@ -391,24 +408,24 @@ pub fn render(src: &[u8], link: &mut Link, slug: &mut Slug) -> Md {
                     let m = if is_ord { ordered(l).map(|x| x.1) } else { bullet(l) };
                     if let Some(rest) = m {
                         if let Some(c) = cur.take() {
-                            html.extend_from_slice(b"<li>");
+                            html.put(b"<li>");
                             inline(&c, &mut html, link);
-                            html.extend_from_slice(b"</li>\n");
+                            html.put(b"</li>\\n");
                         }
                         cur = Some(trim_st(rest).to_vec());
                         i += 1;
                     } else if continued(l) {
                         let c = cur.as_mut().unwrap();
                         c.push(b'\n');
-                        c.extend_from_slice(trim_st(l));
+                        c.put(trim_st(l));
                         i += 1;
                     } else {
                         break;
                     }
                 }
-                html.extend_from_slice(b"<li>");
+                html.put(b"<li>");
                 inline(&cur.unwrap_or_default(), &mut html, link);
-                html.extend_from_slice(if is_ord { b"</li>\n</ol>\n" as &[u8] } else { b"</li>\n</ul>\n" });
+                html.put(if is_ord { b"</li>\\n</ol>\\n" as &[u8] } else { b"</li>\\n</ul>\\n" });
                 continue;
             }
         }
@@ -434,18 +451,18 @@ pub fn render(src: &[u8], link: &mut Link, slug: &mut Slug) -> Md {
                 if k > first {
                     t.push(b'\n');
                 }
-                t.extend_from_slice(trim_st(line(k)));
+                t.put(trim_st(line(k)));
             }
             joined = t;
             &joined
         };
-        html.extend_from_slice(b"<p>");
+        html.put(b"<p>");
         let at = html.len();
         inline(text, &mut html, link);
         if excerpt.is_none() {
             excerpt = Some(html[at..].to_vec());
         }
-        html.extend_from_slice(b"</p>\n");
+        html.put(b"</p>\\n");
     }
     Md { html, toc, excerpt: excerpt.unwrap_or_default() }
 }

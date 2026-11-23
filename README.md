@@ -10,9 +10,13 @@ A faster drop-in for makefun-site 1.0.0: the same output tree, byte for byte (ev
 The build is Rust (`sitegen/`): it reads the JSON itself, works on UTF-8 bytes throughout and renders the templates
 straight into the inside of each JSON string. It ships built two ways:
 
-- `sitegen-linux-x64`, a static Linux program (musl): on x86-64 Linux `main.js` runs it first, and it reads
-  `cases.json` and writes `answers.json` itself when it takes every case. Its slugs of non-ASCII text use the
+- `sitegen-linux-x64`, a static Linux program (musl): on x86-64 Linux `main.ts` becomes it at once
+  (`process.execve`, so nothing more of Node runs), and it reads `cases.json` and writes `answers.json` itself when it
+  takes every case; for anything else it becomes `node main.js` in turn. Its slugs of non-ASCII text use the
   `unicode-normalization` crate's NFKD and General_Category Mark, as JavaScript's `normalize('NFKD')` and `\p{M}` do.
+  It scans sixteen bytes at a time (SSE2), reads the JSON in place, renders Markdown straight into JSON-escaped HTML,
+  renders each template piece that reads only `site`, `tags` and `recent` once per site, and hands each case's
+  memory back whole when the case is done.
 - `sitegen.wasm`, for anywhere else, or when the program cannot run: `main.js` hands it the bytes of `cases.json` and
   writes the answers it returns; slugs of non-ASCII text call back into JavaScript. V8 runs the module on its baseline
   compiler alone (`--liftoff-only`): for a one-pass build, optimizing hot functions costs more compiler-thread CPU

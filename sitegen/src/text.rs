@@ -273,20 +273,6 @@ pub fn trim_u(s: &[u8]) -> &[u8] {
     &s[a..z]
 }
 
-/// JavaScript's trim on ASCII text.
-pub fn trim_ascii_js(s: &[u8]) -> &[u8] {
-    let w = |c: u8| c == b' ' || (9..=13).contains(&c);
-    let mut a = 0;
-    let mut z = s.len();
-    while a < z && w(s[a]) {
-        a += 1;
-    }
-    while z > a && w(s[z - 1]) {
-        z -= 1;
-    }
-    &s[a..z]
-}
-
 #[inline]
 pub fn is_st(c: u8) -> bool {
     c == b' ' || c == b'\t'

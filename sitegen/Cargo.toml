@@ -3,11 +3,19 @@ name = "sitegen"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "makefun-site 1.0.0's build in Rust, for WebAssembly"
+description = "makefun-site 1.0.0's build in Rust, for WebAssembly and as a Linux program"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 path = "src/lib.rs"
+
+[[bin]]
+name = "sitegen"
+path = "src/main.rs"
+
+# NFKD for slugs where no JavaScript is there to ask (the Linux program and the native timing harness).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+unicode-normalization = "0.1"
 
 [profile.release]
 opt-level = 2

@@ -1,6 +1,7 @@
-//! makefun-site 1.0.0's build in Rust, for WebAssembly: main.ts hands it cases.json's bytes and writes the answers
-//! it builds. A case it does not take exactly (see build::Input::from_json and build::run) is marked for main.ts to
-//! build in JavaScript instead; slugs of non-ASCII text call back into JavaScript for its NFKD (js_slug).
+//! makefun-site 1.0.0's build in Rust. As WebAssembly, main.js hands it cases.json's bytes and writes the answers it
+//! builds; a case it does not take exactly (see build::Input::from_json and build::run) is marked for main.js to build
+//! in JavaScript instead, and slugs of non-ASCII text call back into JavaScript for its NFKD (js_slug). As a Linux
+//! program (main.rs), it builds the whole answers file or none of it.
 
 mod build;
 mod json;
@@ -10,79 +11,94 @@ mod tpl;
 
 use std::cell::RefCell;
 
-/// The allocator on WebAssembly: one pass over one input needs no freeing, so blocks are handed out in order from
-/// memory grown 16 MB at a time, freeing is nothing, and the last block grows in place.
-#[cfg(target_arch = "wasm32")]
-mod bump {
+/// The allocator: blocks handed out in order from big chunks (WebAssembly memory grown 16 MB at a time, or 64 MB
+/// from the system), freeing is nothing and the last block grows in place. A case's blocks are all given back at
+/// once when it is done (mark and release), so one case's memory is the next one's.
+mod arena {
     use std::alloc::{GlobalAlloc, Layout};
     use std::cell::Cell;
 
-    pub struct Bump {
+    pub struct Arena {
         next: Cell<usize>,
         end: Cell<usize>,
     }
 
-    // WebAssembly here runs on one thread.
-    unsafe impl Sync for Bump {}
+    // The build runs on one thread.
+    unsafe impl Sync for Arena {}
 
-    const PAGE: usize = 0x10000;
+    /// Fresh memory of at least `min` bytes: (start, end). On WebAssembly it starts where memory ended.
+    #[cfg(target_arch = "wasm32")]
+    fn more(min: usize) -> Option<(usize, usize)> {
+        const PAGE: usize = 0x10000;
+        let pages = (min.max(16 << 20) + PAGE - 1) / PAGE;
+        let old = core::arch::wasm32::memory_grow(0, pages);
+        if old == usize::MAX {
+            return None;
+        }
+        Some((old * PAGE, (old + pages) * PAGE))
+    }
 
-    impl Bump {
-        pub const fn new() -> Bump {
-            Bump { next: Cell::new(0), end: Cell::new(0) }
+    #[cfg(not(target_arch = "wasm32"))]
+    fn more(min: usize) -> Option<(usize, usize)> {
+        let size = (min + 4096).max(64 << 20);
+        let p = unsafe { std::alloc::System.alloc(Layout::from_size_align(size, 4096).ok()?) };
+        if p.is_null() {
+            return None;
+        }
+        Some((p as usize, p as usize + size))
+    }
+
+    impl Arena {
+        pub const fn new() -> Arena {
+            Arena { next: Cell::new(0), end: Cell::new(0) }
         }
 
-        /// Room up to address z, or false.
-        fn reach(&self, z: usize) -> bool {
-            if z <= self.end.get() {
-                return true;
+        unsafe fn take(&self, size: usize, align: usize) -> *mut u8 {
+            let a = (self.next.get() + align - 1) & !(align - 1);
+            if self.next.get() != 0 && a + size <= self.end.get() {
+                self.next.set(a + size);
+                return a as *mut u8;
             }
-            let pages = ((z - self.end.get()) / PAGE + 1).max(256);
-            let old = core::arch::wasm32::memory_grow(0, pages);
-            if old == usize::MAX {
-                return false;
+            let Some((start, end)) = more(size + align) else { return core::ptr::null_mut() };
+            // Memory that carries on from the chunk in use extends it; any other is a new chunk.
+            if start != self.end.get() || self.next.get() == 0 {
+                self.next.set(start);
             }
-            if self.end.get() != old * PAGE {
-                // The first growth (or memory grown by anything else): start over at the new pages.
-                self.next.set(old * PAGE);
-                self.end.set(old * PAGE);
-                if z <= old * PAGE {
-                    self.end.set((old + pages) * PAGE);
-                    return true;
-                }
-                self.end.set((old + pages) * PAGE);
-                return false;
+            self.end.set(end);
+            let a = (self.next.get() + align - 1) & !(align - 1);
+            if a + size > end {
+                return core::ptr::null_mut();
             }
-            self.end.set((old + pages) * PAGE);
-            z <= self.end.get()
+            self.next.set(a + size);
+            a as *mut u8
+        }
+
+        pub fn mark(&self) -> (usize, usize) {
+            (self.next.get(), self.end.get())
+        }
+
+        /// Every block taken since `m` given back: none of them may be in use any more.
+        pub fn release(&self, m: (usize, usize)) {
+            if self.end.get() == m.1 && m.0 != 0 {
+                self.next.set(m.0);
+            }
         }
     }
 
-    unsafe impl GlobalAlloc for Bump {
+    unsafe impl GlobalAlloc for Arena {
         unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-            loop {
-                let a = (self.next.get() + l.align() - 1) & !(l.align() - 1);
-                let z = a + l.size();
-                if z <= self.end.get() && self.next.get() != 0 {
-                    self.next.set(z);
-                    return a as *mut u8;
-                }
-                let before = self.end.get();
-                if !self.reach(z.max(self.next.get() + l.size() + l.align())) && self.end.get() == before {
-                    return core::ptr::null_mut();
-                }
-            }
+            self.take(l.size(), l.align())
         }
 
         unsafe fn dealloc(&self, _p: *mut u8, _l: Layout) {}
 
         unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
             let at = p as usize;
-            if at + l.size() == self.next.get() && self.reach(at + new) && self.next.get() == at + l.size() {
+            if at + l.size() == self.next.get() && at + new <= self.end.get() {
                 self.next.set(at + new);
                 return p;
             }
-            let q = self.alloc(Layout::from_size_align_unchecked(new, l.align()));
+            let q = self.take(new, l.align());
             if !q.is_null() {
                 core::ptr::copy_nonoverlapping(p, q, l.size().min(new));
             }
@@ -91,16 +107,30 @@ mod bump {
     }
 }
 
-#[cfg(target_arch = "wasm32")]
 #[global_allocator]
-static ALLOC: bump::Bump = bump::Bump::new();
+static ALLOC: arena::Arena = arena::Arena::new();
+
+/// One case built into `out` (its answer's JSON object): whether it was, every block it took given back after (out
+/// was made big enough beforehand; if it had to grow, nothing is given back).
+fn build_case(j: &json::J, out: &mut Vec<u8>) -> bool {
+    let mark = ALLOC.mark();
+    let cap = out.capacity();
+    let ok = match build::Input::from_json(j) {
+        Some(inp) => build::run(&inp, out),
+        None => false,
+    };
+    if out.capacity() == cap {
+        ALLOC.release(mark);
+    }
+    ok
+}
 
 thread_local! {
     static OUT: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
     static CASES: RefCell<Vec<[u32; 3]>> = const { RefCell::new(Vec::new()) };
 }
 
-/// n bytes for main.ts to fill.
+/// n bytes for main.js to fill.
 #[no_mangle]
 pub extern "C" fn alloc(n: usize) -> *mut u8 {
     let mut v = Vec::<u8>::with_capacity(n.max(1));
@@ -115,19 +145,12 @@ pub extern "C" fn alloc(n: usize) -> *mut u8 {
 #[no_mangle]
 pub extern "C" fn build(p: *const u8, n: usize) -> i32 {
     let src = unsafe { std::slice::from_raw_parts(p, n) };
-    #[cfg(not(target_arch = "wasm32"))]
-    let t = std::time::Instant::now();
     let Some(inputs) = json::parse_cases(src) else { return -1 };
-    #[cfg(not(target_arch = "wasm32"))]
-    eprintln!("  json         {:?}", t.elapsed());
     let mut out = Vec::with_capacity(n * 3);
     let mut cases = Vec::with_capacity(inputs.len());
     for j in &inputs {
         let start = out.len();
-        let ok = match build::Input::from_json(j) {
-            Some(inp) => build::run(&inp, &mut out),
-            None => false,
-        };
+        let ok = build_case(j, &mut out);
         if !ok {
             out.truncate(start);
         }
@@ -137,6 +160,27 @@ pub extern "C" fn build(p: *const u8, n: usize) -> i32 {
     OUT.with(|o| *o.borrow_mut() = out);
     CASES.with(|c| *c.borrow_mut() = cases);
     count
+}
+
+/// The answers file (the JSON array of every case's answer) when this build takes every case of cases.json exactly,
+/// else None: valid UTF-8 with no U+2028 or U+2029 (which a regex "." stops at), as main.js's one-byte check asks.
+pub fn build_all(src: &[u8]) -> Option<Vec<u8>> {
+    if std::str::from_utf8(src).is_err() || src.windows(3).any(|w| w[0] == 0xe2 && w[1] == 0x80 && (w[2] == 0xa8 || w[2] == 0xa9)) {
+        return None;
+    }
+    let inputs = json::parse_cases(src)?;
+    let mut out = Vec::with_capacity(src.len() * 3 + 2);
+    out.push(b'[');
+    for (k, j) in inputs.iter().enumerate() {
+        if k > 0 {
+            out.push(b',');
+        }
+        if !build_case(j, &mut out) {
+            return None;
+        }
+    }
+    out.push(b']');
+    Some(out)
 }
 
 #[no_mangle]

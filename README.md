@@ -7,11 +7,16 @@
 A faster drop-in for makefun-site 1.0.0: the same output tree, byte for byte (every page, the index and tag pages,
 `build-report.txt` and the static files), for a fraction of the CPU time.
 
-The build runs in Rust compiled to WebAssembly (`sitegen/`, built to `sitegen.wasm`): `main.ts` hands it the bytes of
-`cases.json` and writes the answers it returns. It reads the JSON itself, works on UTF-8 bytes throughout, renders the
-templates straight into the inside of each JSON string and never builds a JavaScript string of the output. Only slugs of
-non-ASCII text call back into JavaScript (for its NFKD normalization). V8 runs the module on its baseline compiler
-alone (`--liftoff-only`): for a one-pass build, optimizing hot functions costs more compiler-thread CPU than it saves.
+The build is Rust (`sitegen/`): it reads the JSON itself, works on UTF-8 bytes throughout and renders the templates
+straight into the inside of each JSON string. It ships built two ways:
+
+- `sitegen-linux-x64`, a static Linux program (musl): on x86-64 Linux `main.js` runs it first, and it reads
+  `cases.json` and writes `answers.json` itself when it takes every case. Its slugs of non-ASCII text use the
+  `unicode-normalization` crate's NFKD and General_Category Mark, as JavaScript's `normalize('NFKD')` and `\p{M}` do.
+- `sitegen.wasm`, for anywhere else, or when the program cannot run: `main.js` hands it the bytes of `cases.json` and
+  writes the answers it returns; slugs of non-ASCII text call back into JavaScript. V8 runs the module on its baseline
+  compiler alone (`--liftoff-only`): for a one-pass build, optimizing hot functions costs more compiler-thread CPU
+  than it saves.
 
 Everything else is `solve.js`, the JavaScript build it falls back to: for input the WebAssembly build does not take
 exactly (invalid UTF-8, U+2028 or U+2029, a `\u` escape of a non-ASCII character, an odd `per_page` or `recent`, a static
@@ -43,10 +48,14 @@ MAKEFUN_INPUT_DIR=<dir holding cases.json> MAKEFUN_OUTPUT_DIR=<output dir> node 
 
 `main.ts` needs Node.js 22.18 or later (it runs TypeScript as it is); `solve.js` is a dependency-free ES module.
 
-To rebuild `sitegen.wasm` (no dependencies; Rust with the `wasm32-unknown-unknown` target):
+To rebuild `sitegen.wasm` and `sitegen-linux-x64` (Rust with the `wasm32-unknown-unknown` and
+`x86_64-unknown-linux-musl` targets; `sitegen/.cargo/config.toml` links the Linux program with the `rust-lld` Rust
+ships):
 
 ```sh
-cd sitegen && cargo build --release --target wasm32-unknown-unknown && cp target/wasm32-unknown-unknown/release/sitegen.wasm ..
+cd sitegen
+cargo build --release --target wasm32-unknown-unknown --lib && cp target/wasm32-unknown-unknown/release/sitegen.wasm ..
+cargo build --release --target x86_64-unknown-linux-musl --bin sitegen && cp target/x86_64-unknown-linux-musl/release/sitegen ../sitegen-linux-x64
 ```
 
 ---

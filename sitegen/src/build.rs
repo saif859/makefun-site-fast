@@ -54,11 +54,41 @@ extern "C" {
     fn js_slug(p: *const u8, n: usize, out: *mut u8) -> usize;
 }
 
-/// Off WebAssembly (the native timing harness), a stand-in slug.
+/// Off WebAssembly (the Linux program), the slug of non-ASCII text as JavaScript makes it: NFKD, every mark
+/// (General_Category M, /\p{M}/u) dropped, then the ASCII rules; written at `out`, its length returned.
 #[cfg(not(target_arch = "wasm32"))]
-unsafe fn js_slug(_p: *const u8, _n: usize, out: *mut u8) -> usize {
-    *out = b'u';
-    1
+unsafe fn js_slug(p: *const u8, n: usize, out: *mut u8) -> usize {
+    use unicode_normalization::char::is_combining_mark;
+    use unicode_normalization::UnicodeNormalization;
+    let text = std::str::from_utf8(std::slice::from_raw_parts(p, n)).unwrap_or("");
+    let mut slug: Vec<u8> = Vec::with_capacity(64);
+    let mut gap = false;
+    for ch in text.nfkd() {
+        if is_combining_mark(ch) {
+            continue;
+        }
+        let c = ch.to_ascii_lowercase();
+        if c.is_ascii_lowercase() || c.is_ascii_digit() {
+            if gap {
+                slug.push(b'-');
+            }
+            gap = false;
+            slug.push(c as u8);
+        } else {
+            gap = !slug.is_empty();
+        }
+    }
+    if slug.len() > 64 {
+        slug.truncate(64);
+        if slug[63] == b'-' {
+            slug.truncate(63);
+        }
+    }
+    if slug.is_empty() {
+        slug.extend_from_slice(b"untitled");
+    }
+    std::ptr::copy_nonoverlapping(slug.as_ptr(), out, slug.len());
+    slug.len()
 }
 
 /// makefun-site's slug: ASCII here, other text by JavaScript's NFKD (main.ts's js_slug).
@@ -358,16 +388,7 @@ impl<'o> Out<'o> {
 }
 
 /// Builds one site into `out`; false when it is input this build does not take exactly (out is then left to be cut).
-#[cfg(not(target_arch = "wasm32"))]
-macro_rules! phase { ($t:ident, $name:expr) => { eprintln!("  {:<12} {:?}", $name, $t.elapsed()); $t = std::time::Instant::now(); }; }
-#[cfg(target_arch = "wasm32")]
-macro_rules! phase { ($t:ident, $name:expr) => { let _ = &$t; }; }
-
 pub fn run(inp: &Input, out: &mut Vec<u8>) -> bool {
-    #[cfg(not(target_arch = "wasm32"))]
-    let mut t0 = std::time::Instant::now();
-    #[cfg(target_arch = "wasm32")]
-    let t0 = ();
     let mut slugs = Slugs::default();
     let mut report: Vec<Vec<u8>> = Vec::new();
 
@@ -452,7 +473,6 @@ pub fn run(inp: &Input, out: &mut Vec<u8>) -> bool {
         kept.push(Src { path, text, body_at, fm, post, layout, slug: Vec::new(), out_dir: Vec::new(), url: st(b"") });
     }
 
-    phase!(t0, "sources+fm");
     // 3. Permalinks.
     let mut taken: Map<Vec<u8>, Set<Vec<u8>>> = Map::default();
     let mut by_source: Map<&[u8], usize> = Map::default();
@@ -469,7 +489,6 @@ pub fn run(inp: &Input, out: &mut Vec<u8>) -> bool {
         by_source.insert(s.path, k);
     }
 
-    phase!(t0, "permalinks");
     // 4. Markdown, links resolved.
     let static_paths: Set<&[u8]> = statics.iter().map(|f| f.0).collect();
     let mut broken: Vec<Vec<u8>> = Vec::new();
@@ -506,7 +525,6 @@ pub fn run(inp: &Input, out: &mut Vec<u8>) -> bool {
         mds.push(md::render(s.body(), &mut link, &mut slug));
     }
 
-    phase!(t0, "markdown");
     // 5. Posts, newest first then by slug.
     let mut posts: Vec<usize> = (0..kept.len()).filter(|&k| kept[k].post).collect();
     posts.sort_by(|&x, &y| {
@@ -569,7 +587,6 @@ pub fn run(inp: &Input, out: &mut Vec<u8>) -> bool {
     let mut tag_list: Vec<usize> = (0..tags.len()).collect();
     tag_list.sort_by(|&x, &y| tags[y].posts.len().cmp(&tags[x].posts.len()).then_with(|| cmp_units(&tags[x].slug.b, &tags[y].slug.b)));
 
-    phase!(t0, "posts+tags");
     // 7. Layouts.
     let empty = s(b"");
     let date_of = |k: usize| -> (V, V) {
@@ -626,7 +643,6 @@ pub fn run(inp: &Input, out: &mut Vec<u8>) -> bool {
         }
     };
 
-    phase!(t0, "cards");
     let mut w = Out { out, first: true, keys: Set::default() };
     let render_top = |w: &mut Out, key: &[u8], name: &[u8], extra: Vec<(u32, V)>| {
         let t = &templates[name];
@@ -656,7 +672,6 @@ pub fn run(inp: &Input, out: &mut Vec<u8>) -> bool {
         let key = [&src.out_dir[..], b"/index.html"].concat();
         render_top(&mut w, &key, &src.layout, vec![(tpl::K_PAGE, obj(fields))]);
     }
-    phase!(t0, "pages");
     let per = inp.per_page;
     let pages = posts.len().div_ceil(per).max(1);
     let index_url = |k: usize| -> V {
@@ -699,7 +714,6 @@ pub fn run(inp: &Input, out: &mut Vec<u8>) -> bool {
     if templates.contains_key(&b"tags"[..]) {
         render_top(&mut w, b"tags/index.html", b"tags", Vec::new());
     }
-    phase!(t0, "index+tags");
     for f in &statics {
         let path = f.0;
         // JavaScript puts array-index keys first and would overwrite a static build-report.txt in place: not taken here.
@@ -715,7 +729,6 @@ pub fn run(inp: &Input, out: &mut Vec<u8>) -> bool {
         }
     }
 
-    phase!(t0, "statics");
     // 8. The report.
     let mut lines: Vec<Vec<u8>> = report;
     lines.extend(broken);

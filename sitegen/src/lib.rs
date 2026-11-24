@@ -40,6 +40,35 @@ pub mod arena {
     pub struct Arena {
         next: Cell<usize>,
         end: Cell<usize>,
+        /// Blocks given back, one list per size class, each block holding the next one's address: they are handed
+        /// out again before fresh memory is (under gVisor every fresh page costs about as much as 2 µs of work).
+        free: [Cell<usize>; CLASSES],
+    }
+
+    /// Size classes: 16 bytes apart up to 1 KB (classes 1 to 64), then powers of two up to BIG (65 to 78). A block
+    /// of a class is that class's size, 16-byte aligned. Larger blocks, and any aligned beyond 16, have no class:
+    /// they are taken at their own size and never reused.
+    const CLASSES: usize = 79;
+    const BIG: usize = 16 << 20;
+    #[inline(always)]
+    fn class(size: usize) -> usize {
+        if size <= 1024 {
+            (size + 15) >> 4
+        } else {
+            64 + size.next_power_of_two().trailing_zeros() as usize - 10
+        }
+    }
+    #[inline(always)]
+    fn class_size(c: usize) -> usize {
+        if c <= 64 {
+            c << 4
+        } else {
+            1 << (c - 64 + 10)
+        }
+    }
+    #[inline(always)]
+    fn classed(l: &Layout) -> bool {
+        l.align() <= 16 && l.size() <= BIG
     }
 
     // The build runs on one thread.
@@ -59,17 +88,86 @@ pub mod arena {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn more(min: usize) -> Option<(usize, usize)> {
+        #[cfg(all(feature = "probe", target_os = "linux"))]
+        if let Some(r) = probe_pop::populated(min) {
+            return Some(r);
+        }
         let size = (min + 4096).max(64 << 20);
         let p = unsafe { std::alloc::System.alloc(Layout::from_size_align(size, 4096).ok()?) };
         if p.is_null() {
             return None;
         }
+        #[cfg(all(feature = "probe", target_os = "linux"))]
+        probe_pop::first(p as usize);
         Some((p as usize, p as usize + size))
+    }
+
+    /// Under the probe feature: SG_POP=<MB> maps the first chunk that size with MAP_POPULATE (every page present
+    /// before the build touches it), and the arena's high-water mark in its first chunk is kept for the report.
+    #[cfg(all(feature = "probe", target_os = "linux"))]
+    pub mod probe_pop {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
+        static DONE: AtomicBool = AtomicBool::new(false);
+        static START: AtomicUsize = AtomicUsize::new(0);
+        static PEAK: AtomicUsize = AtomicUsize::new(0);
+        extern "C" {
+            fn getenv(n: *const u8) -> *const u8;
+            fn mmap(a: *mut u8, l: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8;
+        }
+        pub fn first(start: usize) {
+            let _ = START.compare_exchange(0, start, Relaxed, Relaxed);
+        }
+        pub fn seen(next: usize) {
+            let s = START.load(Relaxed);
+            if s != 0 && next >= s && next - s < (1 << 32) {
+                PEAK.fetch_max(next - s, Relaxed);
+            }
+        }
+        pub fn peak() -> usize {
+            PEAK.load(Relaxed)
+        }
+        static FREED: AtomicUsize = AtomicUsize::new(0);
+        static ALLOCS: AtomicUsize = AtomicUsize::new(0);
+        /// Bytes given back (or left behind by a realloc that moved) and blocks taken.
+        pub fn count(freed: usize, allocs: usize) {
+            FREED.fetch_add(freed, Relaxed);
+            ALLOCS.fetch_add(allocs, Relaxed);
+        }
+        pub fn counts() -> (usize, usize) {
+            (FREED.load(Relaxed), ALLOCS.load(Relaxed))
+        }
+        pub fn populated(min: usize) -> Option<(usize, usize)> {
+            if DONE.swap(true, Relaxed) {
+                return None;
+            }
+            let v = unsafe { getenv(b"SG_POP\0".as_ptr()) };
+            if v.is_null() {
+                return None;
+            }
+            let (mut mb, mut p) = (0usize, v);
+            unsafe {
+                while (*p).is_ascii_digit() {
+                    mb = mb * 10 + (*p - b'0') as usize;
+                    p = p.add(1);
+                }
+            }
+            if mb == 0 {
+                return None;
+            }
+            let size = (mb << 20).max(min + 4096);
+            // PROT_READ | PROT_WRITE; MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE
+            let a = unsafe { mmap(core::ptr::null_mut(), size, 3, 0x22 | 0x8000, -1, 0) };
+            if a as isize == -1 {
+                return None;
+            }
+            first(a as usize);
+            Some((a as usize, a as usize + size))
+        }
     }
 
     impl Arena {
         pub const fn new() -> Arena {
-            Arena { next: Cell::new(0), end: Cell::new(0) }
+            Arena { next: Cell::new(0), end: Cell::new(0), free: [const { Cell::new(0) }; CLASSES] }
         }
 
         unsafe fn take(&self, size: usize, align: usize) -> *mut u8 {
@@ -81,6 +179,8 @@ pub mod arena {
             let a = (self.next.get() + align - 1) & !(align - 1);
             if self.next.get() != 0 && a + size <= self.end.get() {
                 self.next.set(a + size);
+                #[cfg(all(feature = "probe", target_os = "linux"))]
+                probe_pop::seen(a + size);
                 return a as *mut u8;
             }
             let Some((start, end)) = more(size + align) else { return core::ptr::null_mut() };
@@ -107,26 +207,60 @@ pub mod arena {
         pub fn release(&self, m: (usize, usize)) {
             if self.end.get() == m.1 && m.0 != 0 {
                 self.next.set(m.0);
+                // Blocks given back may lie past the mark, in memory that is fresh again now.
+                for f in &self.free {
+                    f.set(0);
+                }
             }
         }
     }
 
     unsafe impl GlobalAlloc for Arena {
         unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-            self.take(l.size(), l.align())
+            #[cfg(all(feature = "probe", target_os = "linux"))]
+            probe_pop::count(0, 1);
+            if !classed(&l) {
+                return self.take(l.size(), l.align());
+            }
+            let c = class(l.size());
+            let head = self.free[c].get();
+            if head != 0 {
+                self.free[c].set(*(head as *const usize));
+                return head as *mut u8;
+            }
+            self.take(class_size(c), 16)
         }
 
-        unsafe fn dealloc(&self, _p: *mut u8, _l: Layout) {}
+        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+            #[cfg(all(feature = "probe", target_os = "linux"))]
+            probe_pop::count(l.size(), 0);
+            if classed(&l) {
+                let c = class(l.size());
+                *(p as *mut usize) = self.free[c].get();
+                self.free[c].set(p as usize);
+            }
+        }
 
         unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
             let at = p as usize;
-            if at + l.size() == self.next.get() && at + new <= self.end.get() {
-                self.next.set(at + new);
+            // What the block spans now, and what it would span at the new size (its class's size when classed).
+            let span = if classed(&l) { class_size(class(l.size())) } else { l.size() };
+            let nl = Layout::from_size_align_unchecked(new, l.align());
+            let want = if classed(&nl) { class_size(class(new)) } else { new };
+            if classed(&l) && classed(&nl) && want <= span {
+                // It fits the block it has (a shrink to a smaller class wastes the rest, as dealloc will file it
+                // under that class).
                 return p;
             }
-            let q = self.take(new, l.align());
+            if at + span == self.next.get() && at + want <= self.end.get() && (classed(&l) == classed(&nl)) {
+                // The last block taken grows in place.
+                self.next.set(at + want);
+                return p;
+            }
+            let q = self.alloc(nl);
             if !q.is_null() {
                 core::ptr::copy_nonoverlapping(p, q, l.size().min(new));
+                self.dealloc(p, l);
             }
             q
         }
@@ -253,7 +387,11 @@ pub mod probe {
             }
         });
         let (t, n) = WRITES.with(|w| w.get());
-        eprintln!("{} write={:.2} writes={}", s, t as f64 / 1e6, n);
+        #[cfg(target_os = "linux")]
+        let (peak, (freed, allocs)) = (super::arena::probe_pop::peak() as f64 / (1 << 20) as f64, super::arena::probe_pop::counts());
+        #[cfg(not(target_os = "linux"))]
+        let (peak, (freed, allocs)) = (0.0, (0usize, 0usize));
+        eprintln!("{} write={:.2} writes={} peak={:.1} freed={:.1} allocs={}", s, t as f64 / 1e6, n, peak, freed as f64 / (1 << 20) as f64, allocs);
     }
 }
 

@@ -1,4 +1,4 @@
-// The build main.ts hands over to when the native build does not take the input. It reads
+// The build main.ts hands over to (an ES module: there is no package.json) when the native build does not take the input. It reads
 // every case from /input/cases.json (a JSON array of {id, input}), answers each one alone, and writes
 // /output/answers.json: a JSON array of the answers, one per case and in the cases' order. Outside a container
 // MAKEFUN_INPUT_DIR and MAKEFUN_OUTPUT_DIR stand in for /input and /output.

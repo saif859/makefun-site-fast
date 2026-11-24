@@ -480,10 +480,10 @@ pub fn build_all(src: &mut [u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// As a Node addon on x86-64 Linux (sitegen-linux-x64.node, which main.ts loads with process.dlopen), the module's
+/// As a Node addon on x86-64 Linux (sitegen-linux-x64.node, which main.ts loads with require), the module's
 /// registration is the build: it reads cases.json and, when it takes every case, writes answers.json and ends the
 /// process at once (exit_group, so nothing more of Node runs; the file is closed by then). For input it does not
-/// take it returns, and main.ts goes on to main.js. It calls nothing of Node's.
+/// take it sets SITEGEN_NO_NATIVE and returns, and main.ts goes on to main.js. It calls nothing of Node's.
 #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
 #[no_mangle]
 pub unsafe extern "C" fn napi_register_module_v1(_env: *mut core::ffi::c_void, exports: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
@@ -513,6 +513,12 @@ pub unsafe extern "C" fn napi_register_module_v1(_env: *mut core::ffi::c_void, e
             core::arch::asm!("syscall", in("rax") 231usize, in("rdi") 0usize, options(noreturn));
         }
     }
+    // Not taken: main.ts goes on to main.js, which this tells to leave the native builds alone (process.env reads
+    // the process's own environment).
+    extern "C" {
+        fn setenv(name: *const u8, value: *const u8, overwrite: i32) -> i32;
+    }
+    setenv(b"SITEGEN_NO_NATIVE\0".as_ptr(), b"1\0".as_ptr(), 1);
     exports
 }
 

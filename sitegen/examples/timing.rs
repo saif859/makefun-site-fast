@@ -1,8 +1,10 @@
 // Native timing of the build on a cases.json, best of N runs per phase:
-// cargo run --release --features timing --example timing -- <cases.json> [runs]
+// cargo run --release --features timing --example timing -- <cases.json> [runs] [answers.json]
 fn main() {
     let path = std::env::args().nth(1).expect("cases.json");
     let runs: usize = std::env::args().nth(2).map(|s| s.parse().unwrap()).unwrap_or(20);
+    // Where each run writes its answers (the system's temporary folder unless given).
+    let out_path = std::env::args().nth(3).unwrap_or_else(|| std::env::temp_dir().join("timing-answers.json").to_string_lossy().into_owned());
     let bytes = std::fs::read(path).unwrap();
     let mut best_total = std::time::Duration::MAX;
     let mut best: std::collections::BTreeMap<&str, std::time::Duration> = Default::default();
@@ -14,7 +16,7 @@ fn main() {
         let base = sitegen::arena::taken();
         let mut input = bytes.clone();
         let t = std::time::Instant::now();
-        let out = sitegen::build_to_file(&mut input, "C:/Users/SAFIUD~1/AppData/Local/Temp/claude/a479ac777d22ffec/7cea6c6b-5f06-47bb-a4c2-f69219ad7cc1/scratchpad/timing-answers.json");
+        let out = sitegen::build_to_file(&mut input, &out_path);
         assert!(out, "built");
         let total = t.elapsed();
         std::hint::black_box(out);

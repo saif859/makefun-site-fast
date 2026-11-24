@@ -367,10 +367,13 @@ struct Tag {
 }
 
 /// The output object's writer: `{"path":"text",...}`, each text JSON-escaped.
-struct Out<'o> {
+struct Out<'o, 's> {
     out: &'o mut Vec<u8>,
     first: bool,
-    keys: Set<Vec<u8>>,
+    /// The static files' paths, and whether a key written so far is each one's (a static file a built page, or an
+    /// earlier static file, has the path of is shadowed): the only keys anything asks about.
+    statics: Vec<&'s [u8]>,
+    taken: Vec<bool>,
     /// Hands out what is written so far (and empties it) once it passes FLUSH_AT: the answers stream through a
     /// small buffer instead of one the size of the whole file (on WebAssembly it keeps everything).
     flush: &'o mut dyn FnMut(&mut Vec<u8>),
@@ -380,14 +383,18 @@ struct Out<'o> {
 /// out in a few writes (under gVisor, the grader's sandbox, each write call costs about as much as 100 KB written).
 pub const FLUSH_AT: usize = 2 << 20;
 
-impl<'o> Out<'o> {
+impl<'o, 's> Out<'o, 's> {
     fn open(&mut self, key: &[u8]) {
         self.out.push(if self.first { b'{' } else { b',' });
         self.first = false;
         self.out.push(b'"');
         json_into(self.out, key);
         self.out.put(b"\":\"");
-        self.keys.insert(key.to_vec());
+        for (k, s) in self.statics.iter().enumerate() {
+            if *s == key {
+                self.taken[k] = true;
+            }
+        }
     }
     fn close(&mut self) {
         self.out.push(b'"');
@@ -457,19 +464,18 @@ pub fn run(inp: &Input, out: &mut Vec<u8>, flush: &mut dyn FnMut(&mut Vec<u8>)) 
         let text: std::borrow::Cow<[u8]> = if find_byte(c, b'\r').is_none() {
             std::borrow::Cow::Borrowed(c)
         } else {
+            // Each "\r\n" or lone "\r" a "\n", the runs between copied whole.
             let mut t = Vec::with_capacity(c.len());
             let mut i = 0;
-            while i < c.len() {
-                if c[i] == b'\r' {
-                    t.push(b'\n');
-                    if c.get(i + 1) == Some(&b'\n') {
-                        i += 1;
-                    }
-                } else {
-                    t.push(c[i]);
+            while let Some(k) = find_byte(&c[i..], b'\r') {
+                t.extend_from_slice(&c[i..i + k]);
+                t.push(b'\n');
+                i += k + 1;
+                if c.get(i) == Some(&b'\n') {
+                    i += 1;
                 }
-                i += 1;
             }
+            t.extend_from_slice(&c[i..]);
             std::borrow::Cow::Owned(t)
         };
         // 2. Front matter.
@@ -583,12 +589,12 @@ pub fn run(inp: &Input, out: &mut Vec<u8>, flush: &mut dyn FnMut(&mut Vec<u8>)) 
 
     // 6. Tags.
     let mut own_tags = |s: &Src| -> Vec<(Vec<u8>, Vec<u8>)> {
-        let mut seen: Set<Vec<u8>> = Set::default();
-        let mut out = Vec::new();
+        // A post's few tags, each slug once (the first name for it kept).
+        let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         if let Some(list) = &s.fm.tags {
             for name in list {
                 let slug = slugs.get(name);
-                if seen.insert(slug.clone()) {
+                if !out.iter().any(|(_, x)| *x == slug) {
                     out.push((name.clone(), slug));
                 }
             }
@@ -678,19 +684,23 @@ pub fn run(inp: &Input, out: &mut Vec<u8>, flush: &mut dyn FnMut(&mut Vec<u8>)) 
             .collect(),
     ));
     let recent = V::Arr(Rc::new(posts.iter().take(inp.recent).map(|&p| card(p)).collect()));
+    // A post's link (its newer and older posts' pages show it), made once from its card's own values.
+    let mut links: Vec<V> = vec![V::Null; kept.len()];
+    for &p in &posts {
+        if let Some(V::Obj(c)) = &cards[p] {
+            links[p] = obj(vec![(tpl::K_TITLE, c[0].1.clone()), (tpl::K_URL, c[1].1.clone()), (tpl::K_DATE, c[2].1.clone()), (tpl::K_DATE_LONG, c[3].1.clone())]);
+        }
+    }
     let link_of = |p: Option<usize>| -> V {
         match p {
             None => V::Null,
-            Some(k) => {
-                let (date, date_long) = date_of(k);
-                obj(vec![(tpl::K_TITLE, s(kept[k].fm.title.as_ref().unwrap())), (tpl::K_URL, V::Str(kept[k].url.clone())), (tpl::K_DATE, date), (tpl::K_DATE_LONG, date_long)])
-            }
+            Some(k) => links[k].clone(),
         }
     };
 
     phase!(t0, "cards");
     let ctx = tpl::Ctx::new(&templates);
-    let mut w = Out { out, first: true, keys: Set::default(), flush };
+    let mut w = Out { out, first: true, statics: statics.iter().map(|f| f.0).collect(), taken: vec![false; statics.len()], flush };
     let render_top = |w: &mut Out, key: &[u8], name: &[u8], extra: Vec<(u32, V)>| {
         let t = &templates[name];
         let mut vars: Vec<(u32, &V)> = vec![(tpl::K_SITE, &site), (tpl::K_TAGS, &all_tags), (tpl::K_RECENT, &recent)];
@@ -701,14 +711,15 @@ pub fn run(inp: &Input, out: &mut Vec<u8>, flush: &mut dyn FnMut(&mut Vec<u8>)) 
     };
     for k in 0..kept.len() {
         let src = &kept[k];
-        let mut fields = match &cards[k] {
-            Some(V::Obj(c)) => (**c).clone(),
-            _ => card_fields(k),
-        };
-        let toc = mds[k]
-            .toc
-            .iter()
-            .map(|(level, id, html)| obj(vec![(tpl::K_LEVEL, V::Num(*level as i64)), (tpl::K_ID, s(id)), (tpl::K_HTML, V::Str(st_json(html.clone())))]))
+        let mut fields = Vec::with_capacity(14);
+        match &cards[k] {
+            Some(V::Obj(c)) => fields.extend(c.iter().cloned()),
+            _ => fields.extend(card_fields(k)),
+        }
+        // Each page's contents is read once: its entries' strings move into it.
+        let toc = std::mem::take(&mut mds[k].toc)
+            .into_iter()
+            .map(|(level, id, html)| obj(vec![(tpl::K_LEVEL, V::Num(level as i64)), (tpl::K_ID, V::Str(tpl::st_vec(id))), (tpl::K_HTML, V::Str(st_json(html)))]))
             .collect();
         fields.push((tpl::K_SLUG, s(&src.slug)));
         fields.push((tpl::K_CONTENT, V::Str(md_strs[k].0.clone())));
@@ -763,9 +774,9 @@ pub fn run(inp: &Input, out: &mut Vec<u8>, flush: &mut dyn FnMut(&mut Vec<u8>)) 
         render_top(&mut w, b"tags/index.html", b"tags", Vec::new());
     }
     phase!(t0, "index+tags");
-    for f in &statics {
+    for (k, f) in statics.iter().enumerate() {
         let path = f.0;
-        if w.keys.contains(path) {
+        if w.taken[k] {
             report.push(msg(&[b"shadowed ", path, b": a built page has its path"]));
         } else {
             w.open(path);

@@ -95,60 +95,92 @@ fn ends(l: &[u8]) -> bool {
     }
 }
 
+/// The first index at or after `from` (at most s.len()) whose byte is a or b.
+#[inline]
+fn find2(s: &[u8], from: usize, a: u8, b: u8) -> Option<usize> {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use std::arch::x86_64::*;
+        let n = s.len();
+        let p = s.as_ptr();
+        let (va, vb) = (_mm_set1_epi8(a as i8), _mm_set1_epi8(b as i8));
+        let hits = |at: usize| -> u32 {
+            let v = _mm_loadu_si128(p.add(at) as *const __m128i);
+            _mm_movemask_epi8(_mm_or_si128(_mm_cmpeq_epi8(v, va), _mm_cmpeq_epi8(v, vb))) as u32
+        };
+        let mut i = from;
+        while i + 16 <= n {
+            let m = hits(i);
+            if m != 0 {
+                return Some(i + m.trailing_zeros() as usize);
+            }
+            i += 16;
+        }
+        if i >= n {
+            return None;
+        }
+        if n >= 16 {
+            // The last 16 bytes, those before i left out.
+            let base = n - 16;
+            let m = hits(base) & !((1u32 << (i - base)) - 1);
+            return if m != 0 { Some(base + m.trailing_zeros() as usize) } else { None };
+        }
+        while i < n {
+            if s[i] == a || s[i] == b {
+                return Some(i);
+            }
+            i += 1;
+        }
+        None
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        s[from..].iter().position(|&c| c == a || c == b).map(|k| from + k)
+    }
+}
+
 /// First ']' from `from` outside a backslash escape.
 fn find_close(s: &[u8], from: usize) -> Option<usize> {
     let n = s.len();
     let mut j = from;
-    while j < n {
-        let c = s[j];
-        if c == b'\\' && j + 1 < n && is_escapable(s[j + 1]) {
-            j += 2;
+    loop {
+        j = find2(s, j, b']', b'\\')?;
+        if s[j] == b'\\' {
+            j += if j + 1 < n && is_escapable(s[j + 1]) { 2 } else { 1 };
             continue;
         }
-        if c == b']' {
-            return Some(j);
-        }
-        j += 1;
+        return Some(j);
     }
-    None
 }
 
-/// First '**' from `from` outside a backslash escape.
+/// First '**' from `from` outside a backslash escape (a '*' or backslash in the last byte opens nothing).
 fn find_double(s: &[u8], from: usize) -> Option<usize> {
     let n = s.len();
     let mut j = from;
-    while j + 2 <= n {
-        let c = s[j];
-        if c == b'\\' {
-            if is_escapable(s[j + 1]) {
-                j += 1;
-            }
-            j += 1;
+    loop {
+        j = find2(s, j, b'*', b'\\')?;
+        if j + 2 > n {
+            return None;
+        }
+        if s[j] == b'\\' {
+            j += if is_escapable(s[j + 1]) { 2 } else { 1 };
             continue;
         }
-        if c == b'*' && s[j + 1] == b'*' {
+        if s[j + 1] == b'*' {
             return Some(j);
         }
         j += 1;
     }
-    None
 }
 
 /// First single '*' from `from` (its run not '**'), outside an escape.
 fn find_single_star(s: &[u8], from: usize) -> Option<usize> {
     let n = s.len();
     let mut j = from;
-    while j < n {
-        let c = s[j];
-        if c == b'\\' {
-            if j + 1 < n && is_escapable(s[j + 1]) {
-                j += 1;
-            }
-            j += 1;
-            continue;
-        }
-        if c != b'*' {
-            j += 1;
+    loop {
+        j = find2(s, j, b'*', b'\\')?;
+        if s[j] == b'\\' {
+            j += if j + 1 < n && is_escapable(s[j + 1]) { 2 } else { 1 };
             continue;
         }
         if j + 1 < n && s[j + 1] == b'*' {
@@ -157,7 +189,6 @@ fn find_single_star(s: &[u8], from: usize) -> Option<usize> {
         }
         return Some(j);
     }
-    None
 }
 
 /// Text from i up to the next character inline Markdown acts on (\ ` * [), appended to out HTML- and JSON-escaped:
@@ -172,16 +203,26 @@ fn esc_run(t: &[u8], mut i: usize, out: &mut Vec<u8>) -> usize {
         let p = t.as_ptr();
         let low = _mm_set1_epi8(0x1f);
         let set = [b'&', b'<', b'>', b'"', b'\'', b'\\', b'`', b'*', b'['].map(|c| _mm_set1_epi8(c as i8));
-        while i + 16 <= n {
-            let v = _mm_loadu_si128(p.add(i) as *const __m128i);
+        let mut small = [0u8; 16];
+        while i < n {
+            // The 16 bytes from i; for the last block, t's last 16 (the bytes before i left out); for t shorter than
+            // 16, a copy padded with zeros (the bytes past its end left out).
+            let (v, base, keep) = if i + 16 <= n {
+                (_mm_loadu_si128(p.add(i) as *const __m128i), i, u32::MAX)
+            } else if n >= 16 {
+                (_mm_loadu_si128(p.add(n - 16) as *const __m128i), n - 16, u32::MAX)
+            } else {
+                core::ptr::copy_nonoverlapping(p, small.as_mut_ptr(), n);
+                (_mm_loadu_si128(small.as_ptr() as *const __m128i), 0, (1u32 << n) - 1)
+            };
             let mut m = _mm_cmpeq_epi8(_mm_min_epu8(v, low), v);
             for s in set {
                 m = _mm_or_si128(m, _mm_cmpeq_epi8(v, s));
             }
-            let mut mask = _mm_movemask_epi8(m) as u32;
+            let mut mask = _mm_movemask_epi8(m) as u32 & keep & !((1u32 << (i - base)) - 1);
             // Every flagged byte of the block in turn: escapes written here, Markdown's own characters returned.
             while mask != 0 {
-                let k = i + mask.trailing_zeros() as usize;
+                let k = base + mask.trailing_zeros() as usize;
                 mask &= mask - 1;
                 let c = *p.add(k);
                 out.put(&t[run..k]);
@@ -194,23 +235,8 @@ fn esc_run(t: &[u8], mut i: usize, out: &mut Vec<u8>) -> usize {
                 }
                 run = k + 1;
             }
-            i += 16;
+            i = base + 16;
         }
-    }
-    while i < n {
-        let c = t[i];
-        if CLASS[c as usize] & 4 != 0 {
-            out.put(&t[run..i]);
-            if let Some(e) = entity(c) {
-                out.put(e);
-            } else if c < 0x20 {
-                json_escape(out, c);
-            } else {
-                return i;
-            }
-            run = i + 1;
-        }
-        i += 1;
     }
     out.put(&t[run..n]);
     n
@@ -338,6 +364,7 @@ pub fn inline(t: &[u8], out: &mut Vec<u8>, link: &mut Link) {
 
 /// A source body rendered: its HTML, its h2 and h3 entries and its first paragraph's HTML, each as the inside of
 /// a JSON string (what the answer holds).
+#[inline(never)]
 pub fn render(src: &[u8], link: &mut Link, slug: &mut Slug) -> Md {
     let mut lines: Vec<(usize, usize)> = Vec::new();
     let mut p = 0;

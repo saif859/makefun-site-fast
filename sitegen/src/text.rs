@@ -461,6 +461,16 @@ pub fn words(s: &[u8]) -> usize {
 pub fn cmp_units(a: &[u8], b: &[u8]) -> Ordering {
     let n = a.len().min(b.len());
     let mut i = 0;
+    // The first byte that differs: eight at a time, then one by one.
+    while i + 8 <= n {
+        let x = u64::from_le_bytes(a[i..i + 8].try_into().unwrap());
+        let y = u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
+        if x != y {
+            i += ((x ^ y).trailing_zeros() / 8) as usize;
+            break;
+        }
+        i += 8;
+    }
     while i < n && a[i] == b[i] {
         i += 1;
     }

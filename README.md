@@ -7,16 +7,11 @@
 A faster drop-in for makefun-site 1.0.0: the same output tree, byte for byte (every page, the index and tag pages,
 `build-report.txt` and the static files), for a fraction of the CPU time.
 
-`main.ts`, the program the harness runs (`node /bot/main.ts`), is a symbolic link to `entry.cjs`. Node runs a main
-module from its real path, so it loads `entry.cjs` as CommonJS JavaScript: it has no TypeScript to strip, and so never
-loads its TypeScript compiler (amaro, Node 22's type stripper), which takes more CPU to start than the whole build
-does (on node 22.23.4, an empty `main.ts` costs about 210 million instructions more than an empty `.js` file).
-
 The build is Rust (`sitegen/`): it reads the JSON itself, works on UTF-8 bytes throughout and renders the templates
 straight into the inside of each JSON string. It ships built two ways:
 
 - `sitegen-linux-x64.node`, a Node addon (x86-64 Linux, glibc, built with profile-guided optimization): on x86-64
-  Linux `entry.cjs` loads it (`process.dlopen`) and its module registration is the build: it reads `cases.json` and,
+  Linux `main.ts` loads it (`process.dlopen`) and its module registration is the build: it reads `cases.json` and,
   when it takes every case, writes `answers.json` and ends the process at once (`exit_group`). It calls nothing of
   Node's. Should it not load, `sitegen-linux-x64`, the same build as a static program (musl), takes the process's
   place (`process.execve`). For input neither takes, `main.js` runs. Slugs of non-ASCII text use the
@@ -58,8 +53,7 @@ every output identical.
 MAKEFUN_INPUT_DIR=<dir holding cases.json> MAKEFUN_OUTPUT_DIR=<output dir> node main.ts
 ```
 
-`main.ts` (a symbolic link to `entry.cjs`, so a checkout needs symbolic links: on Windows, `core.symlinks`) runs on
-Node.js 22 or later; `solve.js` is a dependency-free ES module.
+`main.ts` runs on Node.js 22.18 or later (TypeScript run as it is); `solve.js` is a dependency-free ES module.
 
 To rebuild them (Rust with the `wasm32-unknown-unknown`, `x86_64-unknown-linux-musl` and, on Linux with gcc,
 `x86_64-unknown-linux-gnu` targets; `sitegen/.cargo/config.toml` links the static program with the `rust-lld` Rust

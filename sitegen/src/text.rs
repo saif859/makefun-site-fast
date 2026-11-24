@@ -42,6 +42,15 @@ pub fn find_byte(s: &[u8], b: u8) -> Option<usize> {
     None
 }
 
+/// The first index from i of a byte above 0x7f (`high`) or of one not above it (!high), or s.len().
+#[cfg(not(target_arch = "x86_64"))]
+pub fn find_high(s: &[u8], mut i: usize, high: bool) -> usize {
+    while i < s.len() && (s[i] > 0x7f) != high {
+        i += 1;
+    }
+    i
+}
+
 pub fn find_bytes(s: &[u8], pat: &[u8], from: usize) -> Option<usize> {
     if from > s.len() || pat.len() > s.len() - from {
         return None;
@@ -552,6 +561,37 @@ pub fn find_byte(s: &[u8], b: u8) -> Option<usize> {
         i += 1;
     }
     None
+}
+
+/// The first index from i of a byte above 0x7f (`high`) or of one not above it (!high), or s.len().
+#[cfg(target_arch = "x86_64")]
+pub fn find_high(s: &[u8], mut i: usize, high: bool) -> usize {
+    unsafe {
+        let p = s.as_ptr();
+        let flip = if high { 0 } else { 0xffff };
+        if high {
+            // 64 bytes a step until one holds such a byte.
+            while i + 64 <= s.len() {
+                let a = _mm_or_si128(_mm_loadu_si128(p.add(i) as *const __m128i), _mm_loadu_si128(p.add(i + 16) as *const __m128i));
+                let b = _mm_or_si128(_mm_loadu_si128(p.add(i + 32) as *const __m128i), _mm_loadu_si128(p.add(i + 48) as *const __m128i));
+                if _mm_movemask_epi8(_mm_or_si128(a, b)) != 0 {
+                    break;
+                }
+                i += 64;
+            }
+        }
+        while i + 16 <= s.len() {
+            let m = (_mm_movemask_epi8(_mm_loadu_si128(p.add(i) as *const __m128i)) as u32) ^ flip;
+            if m != 0 {
+                return i + m.trailing_zeros() as usize;
+            }
+            i += 16;
+        }
+    }
+    while i < s.len() && (s[i] > 0x7f) != high {
+        i += 1;
+    }
+    i
 }
 
 /// The first index from i of a byte in `set` (or below 0x20, with `ctl`), or s.len(); CLASS bit `bit` marks the

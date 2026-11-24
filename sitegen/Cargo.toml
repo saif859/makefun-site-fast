@@ -20,6 +20,8 @@ unicode-normalization = "0.1"
 [features]
 # Phase timings on stderr (the native timing harness only).
 timing = []
+# The Node addon's step times on stderr, from main.ts's SG_T0 (a measuring build under gVisor, never shipped).
+probe = []
 
 [profile.release]
 opt-level = 2

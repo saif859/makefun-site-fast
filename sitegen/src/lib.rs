@@ -188,22 +188,73 @@ pub extern "C" fn build(p: *mut u8, n: usize) -> i32 {
     count
 }
 
-/// The answers file (the JSON array of every case's answer) when this build takes every case of cases.json exactly,
-/// else None: valid UTF-8 with no U+2028 or U+2029 (which a regex "." stops at), as main.js's one-byte check asks.
 /// Whether this build reads the input at all: valid UTF-8 with no U+2028 or U+2029 (which a regex "." stops at).
+/// Every byte below 0x80 is a character of its own in UTF-8 and every byte of a longer character is above 0x7f, so
+/// the input is valid exactly when each run of bytes above 0x7f is valid on its own, and those runs hold any U+2028
+/// or U+2029 (E2 80 A8, E2 80 A9): only the runs are read, the ASCII between them skipped 64 bytes at a time.
 fn readable(src: &[u8]) -> bool {
-    if std::str::from_utf8(src).is_err() {
-        return false;
-    }
-    let mut at = 0;
-    while let Some(k) = text::find_byte(&src[at..], 0xe2) {
-        let i = at + k;
-        if src.get(i + 1) == Some(&0x80) && matches!(src.get(i + 2), Some(&0xa8) | Some(&0xa9)) {
+    let mut i = text::find_high(src, 0, true);
+    while i < src.len() {
+        let j = text::find_high(src, i, false);
+        let run = &src[i..j];
+        if std::str::from_utf8(run).is_err() {
             return false;
         }
-        at = i + 1;
+        let mut at = 0;
+        while let Some(k) = text::find_byte(&run[at..], 0xe2) {
+            let x = at + k;
+            if run.get(x + 1) == Some(&0x80) && matches!(run.get(x + 2), Some(&0xa8) | Some(&0xa9)) {
+                return false;
+            }
+            at = x + 1;
+        }
+        i = text::find_high(src, j, true);
     }
     true
+}
+
+/// Under the probe feature (a measuring build, never shipped): the wall time of each step of the addon's build, from
+/// main.ts's SG_T0 (its process.hrtime just before process.dlopen), printed to stderr before the process ends, and
+/// the time spent in writes; SG_PROBE=<step> ends it after that step (load, read, utf8, parse; noout writes nothing).
+#[cfg(feature = "probe")]
+pub mod probe {
+    use std::cell::{Cell, RefCell};
+    extern "C" {
+        fn clock_gettime(clk: i32, ts: *mut [i64; 2]) -> i32;
+    }
+    pub fn now() -> i64 {
+        let mut t = [0i64; 2];
+        unsafe { clock_gettime(1, &mut t) };
+        t[0] * 1_000_000_000 + t[1]
+    }
+    thread_local! {
+        static MARKS: RefCell<Vec<(&'static str, i64)>> = const { RefCell::new(Vec::new()) };
+        static WRITES: Cell<(i64, i64)> = const { Cell::new((0, 0)) };
+    }
+    pub fn mark(name: &'static str) {
+        MARKS.with(|m| m.borrow_mut().push((name, now())));
+    }
+    pub fn stop(at: &str) -> bool {
+        std::env::var("SG_PROBE").map(|p| p == at).unwrap_or(false)
+    }
+    pub fn wrote(since: i64) {
+        WRITES.with(|w| {
+            let (t, n) = w.get();
+            w.set((t + now() - since, n + 1))
+        });
+    }
+    pub fn report() {
+        let mut last = std::env::var("SG_T0").ok().and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+        let mut s = String::from("PROBE");
+        MARKS.with(|m| {
+            for &(n, t) in m.borrow().iter() {
+                s.push_str(&format!(" {}={:.2}", n, (t - last) as f64 / 1e6));
+                last = t;
+            }
+        });
+        let (t, n) = WRITES.with(|w| w.get());
+        eprintln!("{} write={:.2} writes={}", s, t as f64 / 1e6, n);
+    }
 }
 
 /// The answers file written to `path`, streamed through a small buffer, when this build takes every case of
@@ -213,16 +264,38 @@ pub fn build_to_file(src: &mut [u8], path: &str) -> bool {
     if !readable(src) {
         return false;
     }
+    #[cfg(feature = "probe")]
+    {
+        probe::mark("utf8");
+        if probe::stop("utf8") {
+            return true;
+        }
+    }
     let Some(inputs) = json::parse_cases(src) else { return false };
+    #[cfg(feature = "probe")]
+    {
+        probe::mark("parse");
+        if probe::stop("parse") {
+            return true;
+        }
+    }
+    #[cfg(feature = "probe")]
+    let null_out = probe::stop("noout");
+    #[cfg(not(feature = "probe"))]
+    let null_out = false;
     let Ok(mut file) = std::fs::File::create(path) else { return false };
     let ok = std::cell::Cell::new(true);
     let mut flush = |b: &mut Vec<u8>| {
-        if ok.get() && file.write_all(b).is_err() {
+        #[cfg(feature = "probe")]
+        let t = probe::now();
+        if !null_out && ok.get() && file.write_all(b).is_err() {
             ok.set(false);
         }
+        #[cfg(feature = "probe")]
+        probe::wrote(t);
         b.clear();
     };
-    let mut out = Vec::with_capacity(1 << 20);
+    let mut out = Vec::with_capacity(2 * build::FLUSH_AT);
     out.push(b'[');
     for (k, j) in inputs.iter().enumerate() {
         if k > 0 {
@@ -233,7 +306,11 @@ pub fn build_to_file(src: &mut [u8], path: &str) -> bool {
         }
     }
     out.push(b']');
+    #[cfg(feature = "probe")]
+    probe::mark("build");
     flush(&mut out);
+    #[cfg(feature = "probe")]
+    probe::mark("last");
     ok.get()
 }
 
@@ -275,8 +352,26 @@ pub unsafe extern "C" fn napi_register_module_v1(_env: *mut core::ffi::c_void, e
     let dir = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
     let input = format!("{}/cases.json", dir("MAKEFUN_INPUT_DIR", "/input"));
     let output = format!("{}/answers.json", dir("MAKEFUN_OUTPUT_DIR", "/output"));
+    #[cfg(feature = "probe")]
+    {
+        probe::mark("load");
+        if probe::stop("load") {
+            probe::report();
+            core::arch::asm!("syscall", in("rax") 231usize, in("rdi") 0usize, options(noreturn));
+        }
+    }
     if let Ok(mut bytes) = std::fs::read(&input) {
+        #[cfg(feature = "probe")]
+        {
+            probe::mark("read");
+            if probe::stop("read") {
+                probe::report();
+                core::arch::asm!("syscall", in("rax") 231usize, in("rdi") 0usize, options(noreturn));
+            }
+        }
         if build_to_file(&mut bytes, &output) {
+            #[cfg(feature = "probe")]
+            probe::report();
             core::arch::asm!("syscall", in("rax") 231usize, in("rdi") 0usize, options(noreturn));
         }
     }

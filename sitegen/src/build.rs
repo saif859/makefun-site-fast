@@ -383,6 +383,22 @@ struct Out<'o, 's> {
 /// out in a few writes (under gVisor, the grader's sandbox, each write call costs about as much as 100 KB written).
 pub const FLUSH_AT: usize = 2 << 20;
 
+/// FLUSH_AT, or under the probe feature SG_FLUSH's bytes when set (a measuring build).
+#[cfg(not(feature = "probe"))]
+#[inline(always)]
+pub fn flush_at() -> usize {
+    FLUSH_AT
+}
+#[cfg(feature = "probe")]
+pub fn flush_at() -> usize {
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    static F: AtomicUsize = AtomicUsize::new(0);
+    if F.load(Relaxed) == 0 {
+        F.store(std::env::var("SG_FLUSH").ok().and_then(|v| v.parse().ok()).filter(|&v: &usize| v > 0).unwrap_or(FLUSH_AT), Relaxed);
+    }
+    F.load(Relaxed)
+}
+
 impl<'o, 's> Out<'o, 's> {
     fn open(&mut self, key: &[u8]) {
         self.out.push(if self.first { b'{' } else { b',' });
@@ -398,7 +414,7 @@ impl<'o, 's> Out<'o, 's> {
     }
     fn close(&mut self) {
         self.out.push(b'"');
-        if self.out.len() >= FLUSH_AT {
+        if self.out.len() >= flush_at() {
             (self.flush)(self.out);
         }
     }
@@ -535,47 +551,7 @@ pub fn run(inp: &Input, out: &mut Vec<u8>, flush: &mut dyn FnMut(&mut Vec<u8>)) 
     }
 
     phase!(t0, "permalinks");
-    // 4. Markdown, links resolved.
-    let static_paths: Set<&[u8]> = statics.iter().map(|f| f.0).collect();
-    let mut broken: Vec<Vec<u8>> = Vec::new();
-    let mut broken_seen: Set<Vec<u8>> = Set::default();
-    let mut mds: Vec<md::Md> = Vec::with_capacity(kept.len());
-    for s in &kept {
-        let dir = dir_of(s.path);
-        let mut link = |target: &[u8]| -> Vec<u8> {
-            let c = target[0];
-            if c == b'/' || c == b'#' || has_scheme(target) {
-                return target.to_vec();
-            }
-            let (rel, frag) = match find_byte(target, b'#') {
-                Some(h) => (&target[..h], &target[h..]),
-                None => (target, &b""[..]),
-            };
-            if !rel.is_empty() {
-                if let Some(path) = resolve_path(dir, rel) {
-                    if let Some(&hit) = by_source.get(path.as_slice()) {
-                        return [&kept[hit].url.b[..], frag].concat();
-                    }
-                    if static_paths.contains(path.as_slice()) {
-                        return [base, b"/", &path, frag].concat();
-                    }
-                }
-            }
-            let line = msg(&[b"broken-link ", s.path, b" -> ", target]);
-            if broken_seen.insert(line.clone()) {
-                broken.push(line);
-            }
-            target.to_vec()
-        };
-        let mut slug = |t: &[u8]| slugify_raw(t);
-        mds.push(md::render(s.body(), &mut link, &mut slug));
-    }
-
-    phase!(t0, "markdown");
-    // Each body's HTML and excerpt as the strings templates see, moved there (no copy).
-    let md_strs: Vec<(Str, Str)> = mds.iter_mut().map(|m| (st_json(std::mem::take(&mut m.html)), st_json(std::mem::take(&mut m.excerpt)))).collect();
-
-    // 5. Posts, newest first then by slug.
+    // 4. Posts, newest first then by slug.
     let mut posts: Vec<usize> = (0..kept.len()).filter(|&k| kept[k].post).collect();
     posts.sort_by(|&x, &y| {
         cmp_units(kept[y].fm.date.as_ref().unwrap(), kept[x].fm.date.as_ref().unwrap()).then_with(|| cmp_units(&kept[x].slug, &kept[y].slug))
@@ -587,7 +563,7 @@ pub fn run(inp: &Input, out: &mut Vec<u8>, flush: &mut dyn FnMut(&mut Vec<u8>)) 
         older[p] = posts.get(k + 1).copied();
     }
 
-    // 6. Tags.
+    // 5. Tags.
     let mut own_tags = |s: &Src| -> Vec<(Vec<u8>, Vec<u8>)> {
         // A post's few tags, each slug once (the first name for it kept).
         let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
@@ -638,17 +614,57 @@ pub fn run(inp: &Input, out: &mut Vec<u8>, flush: &mut dyn FnMut(&mut Vec<u8>)) 
     tag_list.sort_by(|&x, &y| tags[y].posts.len().cmp(&tags[x].posts.len()).then_with(|| cmp_units(&tags[x].slug.b, &tags[y].slug.b)));
 
     phase!(t0, "posts+tags");
+    // 6. Markdown, links resolved. Each source's body is rendered when its page is, so that its HTML lives only that
+    // long (under gVisor every fresh page of memory costs about 2 us); the recent posts' first, as every page can show
+    // their cards.
+    let static_paths: Set<&[u8]> = statics.iter().map(|f| f.0).collect();
+    let mut broken: Vec<Vec<u8>> = Vec::new();
+    let mut broken_seen: Set<Vec<u8>> = Set::default();
+    let mut render_md = |k: usize| -> md::Md {
+        let s = &kept[k];
+        let dir = dir_of(s.path);
+        let mut link = |target: &[u8]| -> Vec<u8> {
+            let c = target[0];
+            if c == b'/' || c == b'#' || has_scheme(target) {
+                return target.to_vec();
+            }
+            let (rel, frag) = match find_byte(target, b'#') {
+                Some(h) => (&target[..h], &target[h..]),
+                None => (target, &b""[..]),
+            };
+            if !rel.is_empty() {
+                if let Some(path) = resolve_path(dir, rel) {
+                    if let Some(&hit) = by_source.get(path.as_slice()) {
+                        return [&kept[hit].url.b[..], frag].concat();
+                    }
+                    if static_paths.contains(path.as_slice()) {
+                        return [base, b"/", &path, frag].concat();
+                    }
+                }
+            }
+            let line = msg(&[b"broken-link ", s.path, b" -> ", target]);
+            if broken_seen.insert(line.clone()) {
+                broken.push(line);
+            }
+            target.to_vec()
+        };
+        let mut slug = |t: &[u8]| slugify_raw(t);
+        md::render(s.body(), &mut link, &mut slug)
+    };
+
     // 7. Layouts.
     let empty = s(b"");
-    let date_of = |k: usize| -> (V, V) {
-        match &kept[k].fm.date {
+    // Each source's title and dates, made once: its card, its page and the pages that link to it share them.
+    let titles: Vec<V> = kept.iter().map(|src| s(src.fm.title.as_ref().unwrap())).collect();
+    let dates: Vec<(V, V)> = kept
+        .iter()
+        .map(|src| match &src.fm.date {
             Some(d) => (s(d), s(&long_date(d))),
             None => (empty.clone(), empty.clone()),
-        }
-    };
-    let card_fields = |k: usize| -> Vec<(u32, V)> {
+        })
+        .collect();
+    let card_fields = |k: usize, excerpt: &Str| -> Vec<(u32, V)> {
         let src = &kept[k];
-        let (date, date_long) = date_of(k);
         let card_tags: Vec<V> = tag_refs[k]
             .iter()
             .map(|r| match r {
@@ -658,21 +674,26 @@ pub fn run(inp: &Input, out: &mut Vec<u8>, flush: &mut dyn FnMut(&mut Vec<u8>)) 
             .collect();
         let minutes = words(src.body()).div_ceil(200).max(1);
         vec![
-            (tpl::K_TITLE, s(src.fm.title.as_ref().unwrap())),
+            (tpl::K_TITLE, titles[k].clone()),
             (tpl::K_URL, V::Str(src.url.clone())),
-            (tpl::K_DATE, date),
-            (tpl::K_DATE_LONG, date_long),
+            (tpl::K_DATE, dates[k].0.clone()),
+            (tpl::K_DATE_LONG, dates[k].1.clone()),
             (tpl::K_SUMMARY, src.fm.summary.as_deref().map(s).unwrap_or_else(|| empty.clone())),
-            (tpl::K_EXCERPT, V::Str(md_strs[k].1.clone())),
+            (tpl::K_EXCERPT, V::Str(excerpt.clone())),
             (tpl::K_READING_MINUTES, V::Num(minutes as i64)),
             (tpl::K_TAGS, V::Arr(Rc::new(card_tags))),
         ]
     };
+    // A post's card is made with its page; the recent posts' (on every page) first, their bodies kept for their pages.
     let mut cards: Vec<Option<V>> = vec![None; kept.len()];
-    for &p in &posts {
-        cards[p] = Some(obj(card_fields(p)));
+    let mut early: Vec<Option<md::Md>> = (0..kept.len()).map(|_| None).collect();
+    let n_recent = inp.recent.min(posts.len());
+    for &p in &posts[..n_recent] {
+        let mut m = render_md(p);
+        let excerpt = st_json(std::mem::take(&mut m.excerpt));
+        cards[p] = Some(obj(card_fields(p, &excerpt)));
+        early[p] = Some(m);
     }
-    let card = |k: usize| cards[k].clone().unwrap();
     let site = obj(vec![(tpl::K_TITLE, s(inp.title)), (tpl::K_BASE_URL, s(base))]);
     let all_tags = V::Arr(Rc::new(
         tag_list
@@ -683,13 +704,11 @@ pub fn run(inp: &Input, out: &mut Vec<u8>, flush: &mut dyn FnMut(&mut Vec<u8>)) 
             })
             .collect(),
     ));
-    let recent = V::Arr(Rc::new(posts.iter().take(inp.recent).map(|&p| card(p)).collect()));
-    // A post's link (its newer and older posts' pages show it), made once from its card's own values.
+    let recent = V::Arr(Rc::new(posts[..n_recent].iter().map(|&p| cards[p].clone().unwrap()).collect()));
+    // A post's link (its newer and older posts' pages show it).
     let mut links: Vec<V> = vec![V::Null; kept.len()];
     for &p in &posts {
-        if let Some(V::Obj(c)) = &cards[p] {
-            links[p] = obj(vec![(tpl::K_TITLE, c[0].1.clone()), (tpl::K_URL, c[1].1.clone()), (tpl::K_DATE, c[2].1.clone()), (tpl::K_DATE_LONG, c[3].1.clone())]);
-        }
+        links[p] = obj(vec![(tpl::K_TITLE, titles[p].clone()), (tpl::K_URL, V::Str(kept[p].url.clone())), (tpl::K_DATE, dates[p].0.clone()), (tpl::K_DATE_LONG, dates[p].1.clone())]);
     }
     let link_of = |p: Option<usize>| -> V {
         match p {
@@ -711,18 +730,34 @@ pub fn run(inp: &Input, out: &mut Vec<u8>, flush: &mut dyn FnMut(&mut Vec<u8>)) 
     };
     for k in 0..kept.len() {
         let src = &kept[k];
+        let mut m = match early[k].take() {
+            Some(m) => m,
+            None => render_md(k),
+        };
         let mut fields = Vec::with_capacity(14);
         match &cards[k] {
             Some(V::Obj(c)) => fields.extend(c.iter().cloned()),
-            _ => fields.extend(card_fields(k)),
+            _ => {
+                let excerpt = st_json(std::mem::take(&mut m.excerpt));
+                let f = card_fields(k, &excerpt);
+                if src.post {
+                    let c = obj(f);
+                    if let V::Obj(o) = &c {
+                        fields.extend(o.iter().cloned());
+                    }
+                    cards[k] = Some(c);
+                } else {
+                    fields.extend(f);
+                }
+            }
         }
         // Each page's contents is read once: its entries' strings move into it.
-        let toc = std::mem::take(&mut mds[k].toc)
+        let toc = std::mem::take(&mut m.toc)
             .into_iter()
             .map(|(level, id, html)| obj(vec![(tpl::K_LEVEL, V::Num(level as i64)), (tpl::K_ID, V::Str(tpl::st_vec(id))), (tpl::K_HTML, V::Str(st_json(html)))]))
             .collect();
         fields.push((tpl::K_SLUG, s(&src.slug)));
-        fields.push((tpl::K_CONTENT, V::Str(md_strs[k].0.clone())));
+        fields.push((tpl::K_CONTENT, V::Str(st_json(std::mem::take(&mut m.html)))));
         fields.push((tpl::K_TOC, V::Arr(Rc::new(toc))));
         fields.push((tpl::K_NEWER, link_of(newer[k])));
         fields.push((tpl::K_OLDER, link_of(older[k])));
@@ -731,6 +766,7 @@ pub fn run(inp: &Input, out: &mut Vec<u8>, flush: &mut dyn FnMut(&mut Vec<u8>)) 
         render_top(&mut w, &key, &src.layout, vec![(tpl::K_PAGE, obj(fields))]);
     }
     phase!(t0, "pages");
+    let card = |k: usize| cards[k].clone().unwrap();
     let per = inp.per_page;
     let pages = posts.len().div_ceil(per).max(1);
     let index_url = |k: usize| -> V {
@@ -804,6 +840,6 @@ pub fn run(inp: &Input, out: &mut Vec<u8>, flush: &mut dyn FnMut(&mut Vec<u8>)) 
     // The case's memory goes back to the arena whole when it is done (see lib.rs), so its values are not dropped one
     // by one.
     std::mem::forget(ctx);
-    std::mem::forget((w, cards, md_strs, mds, tags, tag_refs, site, all_tags, recent, kept, templates, by_slug, slugs));
+    std::mem::forget((w, cards, early, links, titles, dates, tags, tag_refs, site, all_tags, recent, kept, templates, by_slug, slugs));
     true
 }

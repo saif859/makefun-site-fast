@@ -433,7 +433,7 @@ pub fn build_to_file(src: &mut [u8], path: &str) -> bool {
         probe::wrote(t);
         b.clear();
     };
-    let mut out = Vec::with_capacity(2 * build::FLUSH_AT);
+    let mut out = Vec::with_capacity(2 * build::flush_at());
     out.push(b'[');
     for (k, j) in inputs.iter().enumerate() {
         if k > 0 {

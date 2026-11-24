@@ -191,6 +191,42 @@ fn find_single_star(s: &[u8], from: usize) -> Option<usize> {
     }
 }
 
+/// What esc_run writes for a byte it stops at: its HTML entity (as entity() has it) or else, for a control character,
+/// its JSON escape (as json_escape() writes it), little-endian in a u64, and its length; length 0 for the characters
+/// inline Markdown acts on (\ ` * [).
+#[cfg(target_arch = "x86_64")]
+const ESC: [(u64, u8); 256] = {
+    const fn pack(s: &[u8]) -> (u64, u8) {
+        let mut v = 0u64;
+        let mut i = 0;
+        while i < s.len() {
+            v |= (s[i] as u64) << (8 * i);
+            i += 1;
+        }
+        (v, s.len() as u8)
+    }
+    const H: &[u8; 16] = b"0123456789abcdef";
+    let mut t = [(0u64, 0u8); 256];
+    let mut c = 0;
+    while c < 0x20 {
+        t[c] = match c {
+            8 => pack(b"\\b"),
+            9 => pack(b"\\t"),
+            10 => pack(b"\\n"),
+            12 => pack(b"\\f"),
+            13 => pack(b"\\r"),
+            _ => pack(&[b'\\', b'u', b'0', b'0', H[c >> 4], H[c & 15]]),
+        };
+        c += 1;
+    }
+    t[b'&' as usize] = pack(b"&amp;");
+    t[b'<' as usize] = pack(b"&lt;");
+    t[b'>' as usize] = pack(b"&gt;");
+    t[b'"' as usize] = pack(b"&quot;");
+    t[b'\'' as usize] = pack(b"&#39;");
+    t
+};
+
 /// Text from i up to the next character inline Markdown acts on (\ ` * [), appended to out HTML- and JSON-escaped:
 /// that character's index, or t.len().
 #[cfg(target_arch = "x86_64")]
@@ -220,20 +256,38 @@ fn esc_run(t: &[u8], mut i: usize, out: &mut Vec<u8>) -> usize {
                 m = _mm_or_si128(m, _mm_cmpeq_epi8(v, s));
             }
             let mut mask = _mm_movemask_epi8(m) as u32 & keep & !((1u32 << (i - base)) - 1);
-            // Every flagged byte of the block in turn: escapes written here, Markdown's own characters returned.
-            while mask != 0 {
-                let k = base + mask.trailing_zeros() as usize;
-                mask &= mask - 1;
-                let c = *p.add(k);
-                out.put(&t[run..k]);
-                if let Some(e) = entity(c) {
-                    out.put(e);
-                } else if c < 0x20 {
-                    json_escape(out, c);
-                } else {
-                    return k;
+            if mask != 0 {
+                // Room for the bytes not yet written and this block, every one at its longest escape (6), and 16 more:
+                // then the text before each flagged byte goes out in one 16-byte store when it can, and its escape in
+                // one 8-byte store.
+                let len = out.len();
+                let need = (base + 16 - run) * 6 + 32;
+                if out.capacity() - len < need {
+                    out.reserve(need);
                 }
-                run = k + 1;
+                let start = out.as_mut_ptr();
+                let mut o = start.add(len);
+                // Every flagged byte of the block in turn: escapes written here, Markdown's own characters returned.
+                while mask != 0 {
+                    let k = base + mask.trailing_zeros() as usize;
+                    mask &= mask - 1;
+                    let gap = k - run;
+                    if gap <= 16 && run + 16 <= n {
+                        (o as *mut [u8; 16]).write_unaligned((p.add(run) as *const [u8; 16]).read_unaligned());
+                    } else {
+                        core::ptr::copy_nonoverlapping(p.add(run), o, gap);
+                    }
+                    o = o.add(gap);
+                    let (w, l) = ESC[*p.add(k) as usize];
+                    if l == 0 {
+                        out.set_len(o.offset_from(start) as usize);
+                        return k;
+                    }
+                    (o as *mut u64).write_unaligned(w);
+                    o = o.add(l as usize);
+                    run = k + 1;
+                }
+                out.set_len(o.offset_from(start) as usize);
             }
             i = base + 16;
         }
@@ -366,20 +420,14 @@ pub fn inline(t: &[u8], out: &mut Vec<u8>, link: &mut Link) {
 /// a JSON string (what the answer holds).
 #[inline(never)]
 pub fn render(src: &[u8], link: &mut Link, slug: &mut Slug) -> Md {
-    let mut lines: Vec<(usize, usize)> = Vec::new();
+    // The lines, split at each "\n" (found sixteen bytes at a time).
+    let mut lines: Vec<(usize, usize)> = Vec::with_capacity(src.len() / 32 + 8);
     let mut p = 0;
-    loop {
-        match find_byte(&src[p..], b'\n') {
-            Some(o) => {
-                lines.push((p, p + o));
-                p += o + 1;
-            }
-            None => {
-                lines.push((p, src.len()));
-                break;
-            }
-        }
-    }
+    each_byte(src, b'\n', |q| {
+        lines.push((p, q));
+        p = q + 1;
+    });
+    lines.push((p, src.len()));
     let line = |k: usize| &src[lines[k].0..lines[k].1];
     let nl = lines.len();
     let mut ids: Set<Vec<u8>> = Set::default();

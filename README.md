@@ -22,7 +22,8 @@ straight into the inside of each JSON string. It ships built three ways:
   it sets `SITEGEN_NO_NATIVE` and returns, and `main.ts` goes on to `main.js`. Slugs of non-ASCII text use the
   `unicode-normalization` crate's NFKD and General_Category Mark, as JavaScript's `normalize('NFKD')` and `\p{M}` do.
   It scans sixteen bytes at a time (SSE2), reads the JSON in place, renders Markdown straight into JSON-escaped HTML,
-  renders each template piece that reads only `site`, `tags` and `recent` once per site, hands freed memory out again
+  renders each template piece that reads only `site`, `tags` and `recent` once per site, renders each source's
+  Markdown just before its page (so a body's HTML lives only that long; the recent posts' first), hands freed memory out again
   (under gVisor, the grader's sandbox, every fresh page costs about 2 µs) and each case's memory back whole when the
   case is done, and writes the answers in 2 MB pieces (there, every write call costs about as much as 100 KB written).
 - `sitegen-linux-x64`, the same build as a static program (musl), which `main.js` runs first on x86-64 Linux when the

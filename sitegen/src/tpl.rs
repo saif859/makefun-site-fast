@@ -4,7 +4,7 @@
 
 use crate::text::*;
 
-use std::cell::OnceCell;
+use std::cell::{Cell, OnceCell};
 use std::rc::Rc;
 
 // Every name a template reads is an interned id: the names the build's values use are fixed ones, the rest (loop
@@ -73,8 +73,29 @@ pub enum Node {
     Var(Vec<u32>),
     Raw(Vec<u32>),
     If(bool, Vec<u32>, Vec<Node>, Option<Vec<Node>>),
-    For(u32, Vec<u32>, Vec<Node>),
-    Include(Vec<u8>),
+    For(u32, Vec<u32>, Vec<Node>, Meta),
+    Include(Vec<u8>, Meta),
+}
+
+/// No name.
+const NONE: u32 = u32::MAX;
+
+/// What Ctx::new works out once about a for or include node, for every render to read (no lookups by the node).
+pub struct Meta {
+    /// Its output reads nothing but the build-wide names (site, tags, recent): made once per include depth.
+    constant: Cell<bool>,
+    /// For an include whose template reads one name besides those (not loop): that name; NONE otherwise.
+    item: Cell<u32>,
+    /// For an include: its template (null when no template has the name).
+    target: Cell<*const Vec<Node>>,
+    /// A constant node's output once made, by include depth: its place in Ctx's buf (start NONE until made).
+    made: [Cell<(u32, u32)>; INCLUDE_DEPTH + 1],
+}
+
+impl Default for Meta {
+    fn default() -> Meta {
+        Meta { constant: Cell::new(false), item: Cell::new(NONE), target: Cell::new(std::ptr::null()), made: std::array::from_fn(|_| Cell::new((NONE, 0))) }
+    }
 }
 
 /// A value templates see. Null stands for null and undefined alike (no rule tells them apart); Loop(k, n) is the loop
@@ -320,10 +341,10 @@ pub fn parse(name: &[u8], src: &[u8], keys: &mut Keys) -> Result<Vec<Node>, Vec<
                         _ => return Err(err(name, &[b"an " as &[u8], &tag, b" with no open ", &tag[3..]].concat())),
                     }
                     let o = stack.pop().unwrap();
-                    let node = if o.is_for { Node::For(o.name, o.path, o.body) } else { Node::If(o.not, o.path, o.body, o.els) };
+                    let node = if o.is_for { Node::For(o.name, o.path, o.body, Meta::default()) } else { Node::If(o.not, o.path, o.body, o.els) };
                     cur(&mut root, &mut stack).push(node);
                 } else if let Some(inc) = include_tag(&tag) {
-                    cur(&mut root, &mut stack).push(Node::Include(inc.to_vec()));
+                    cur(&mut root, &mut stack).push(Node::Include(inc.to_vec(), Meta::default()));
                 } else {
                     return Err(err(name, &[b"{% " as &[u8], &tag, b" %} is not a tag"].concat()));
                 }
@@ -498,13 +519,13 @@ fn free_of(nodes: &[Node], inc: &Map<Vec<u8>, Vec<u32>>, out: &mut Vec<u32>) {
                     free_of(e, inc, out);
                 }
             }
-            Node::For(name, p, body) => {
+            Node::For(name, p, body, _) => {
                 out.push(p[0]);
                 let mut b = Vec::new();
                 free_of(body, inc, &mut b);
                 out.extend(b.into_iter().filter(|k| *k != *name && *k != K_LOOP));
             }
-            Node::Include(t) => {
+            Node::Include(t, _) => {
                 if let Some(f) = inc.get(t) {
                     out.extend(f.iter().copied());
                 }
@@ -513,9 +534,9 @@ fn free_of(nodes: &[Node], inc: &Map<Vec<u8>, Vec<u32>>, out: &mut Vec<u32>) {
     }
 }
 
-/// The include and for nodes whose output reads nothing but the build-wide names (site, tags, recent), by address;
-/// and the include nodes whose template reads those and one name more (not loop): that name, by the node's address.
-pub fn constants(tpls: &Map<Vec<u8>, Vec<Node>>) -> (Set<usize>, Map<usize, u32>) {
+/// Each for and include node's Meta set: whether its output reads nothing but the build-wide names (site, tags,
+/// recent); for an include, its template and, when that template reads those and one name more (not loop), that name.
+fn mark(tpls: &Map<Vec<u8>, Vec<Node>>) {
     let mut free: Map<Vec<u8>, Vec<u32>> = tpls.keys().map(|k| (k.clone(), Vec::new())).collect();
     loop {
         let mut changed = false;
@@ -533,32 +554,33 @@ pub fn constants(tpls: &Map<Vec<u8>, Vec<Node>>) -> (Set<usize>, Map<usize, u32>
             break;
         }
     }
-    let mut out = Set::default();
-    let mut item = Map::default();
-    fn visit(nodes: &[Node], free: &Map<Vec<u8>, Vec<u32>>, out: &mut Set<usize>, item: &mut Map<usize, u32>) {
+    fn visit(nodes: &[Node], tpls: &Map<Vec<u8>, Vec<Node>>, free: &Map<Vec<u8>, Vec<u32>>) {
         for n in nodes {
             match n {
                 Node::If(_, _, then, els) => {
-                    visit(then, free, out, item);
+                    visit(then, tpls, free);
                     if let Some(e) = els {
-                        visit(e, free, out, item);
+                        visit(e, tpls, free);
                     }
                 }
-                Node::For(_, _, body) => {
+                Node::For(_, _, body, meta) => {
                     let mut f = Vec::new();
                     free_of(std::slice::from_ref(n), free, &mut f);
                     if f.iter().all(|k| GLOBALS.contains(k)) {
-                        out.insert(n as *const Node as usize);
+                        meta.constant.set(true);
                     }
-                    visit(body, free, out, item);
+                    visit(body, tpls, free);
                 }
-                Node::Include(t) => {
+                Node::Include(t, meta) => {
+                    if let Some(target) = tpls.get(t) {
+                        meta.target.set(target as *const Vec<Node>);
+                    }
                     if let Some(f) = free.get(t) {
                         let other: Vec<u32> = f.iter().copied().filter(|k| !GLOBALS.contains(k)).collect();
                         if other.is_empty() {
-                            out.insert(n as *const Node as usize);
+                            meta.constant.set(true);
                         } else if other.len() == 1 && other[0] != K_LOOP {
-                            item.insert(n as *const Node as usize, other[0]);
+                            meta.item.set(other[0]);
                         }
                     }
                 }
@@ -567,27 +589,22 @@ pub fn constants(tpls: &Map<Vec<u8>, Vec<Node>>) -> (Set<usize>, Map<usize, u32>
         }
     }
     for nodes in tpls.values() {
-        visit(nodes, &free, &mut out, &mut item);
+        visit(nodes, tpls, &free);
     }
-    (out, item)
 }
 
-/// What a build's renders share: its templates, the nodes whose output is the same in every render (at one include
-/// depth) and that output once made, kept in `buf`.
+/// What a build's renders share: its templates (their nodes marked, see mark) and the output made once, kept in
+/// `buf`: a constant node's (where its Meta says) and an item include's, by (template, include depth, object).
 pub struct Ctx<'t> {
     pub tpls: &'t Map<Vec<u8>, Vec<Node>>,
-    pub constant: Set<usize>,
-    /// Include nodes whose output is fixed by one name's object (a card's post): that name.
-    item: Map<usize, u32>,
-    /// Output once made, by (node or template, include depth, object or 0).
     cache: std::cell::RefCell<Map<(usize, usize, usize), (usize, usize)>>,
     buf: std::cell::RefCell<Vec<u8>>,
 }
 
 impl<'t> Ctx<'t> {
     pub fn new(tpls: &'t Map<Vec<u8>, Vec<Node>>) -> Ctx<'t> {
-        let (constant, item) = constants(tpls);
-        Ctx { tpls, constant, item, cache: Default::default(), buf: Default::default() }
+        mark(tpls);
+        Ctx { tpls, cache: Default::default(), buf: Default::default() }
     }
 }
 
@@ -618,14 +635,24 @@ fn shadowed(f: &Frame) -> bool {
     false
 }
 
-/// Node n's output (by `make`), from the cache when n is a constant one already made at this depth.
-fn cached(n: &Node, f: &Frame, ctx: &Ctx, depth: usize, out: &mut Vec<u8>, make: impl FnOnce(&mut Vec<u8>)) {
-    let at = n as *const Node as usize;
-    if !ctx.constant.contains(&at) || shadowed(f) {
+/// A node's output (by `make`), kept the first time when it is a constant one and written from there after, at
+/// each include depth.
+fn cached(meta: &Meta, f: &Frame, ctx: &Ctx, depth: usize, out: &mut Vec<u8>, make: impl FnOnce(&mut Vec<u8>)) {
+    if !meta.constant.get() || shadowed(f) {
         make(out);
         return;
     }
-    keyed((at, depth, 0), ctx, out, make);
+    let (a, b) = meta.made[depth].get();
+    if a != NONE {
+        out.put(&ctx.buf.borrow()[a as usize..b as usize]);
+        return;
+    }
+    let start = out.len();
+    make(out);
+    let mut buf = ctx.buf.borrow_mut();
+    let a = buf.len();
+    buf.extend_from_slice(&out[start..]);
+    meta.made[depth].set((a as u32, buf.len() as u32));
 }
 
 /// The output `make` writes, from the cache under `key` when it was made before.
@@ -656,7 +683,7 @@ pub fn render(nodes: &[Node], f: &Frame, ctx: &Ctx, depth: usize, out: &mut Vec<
                     render(e, f, ctx, depth, out);
                 }
             }
-            Node::For(name, path, body) => cached(n, f, ctx, depth, out, |out| {
+            Node::For(name, path, body, meta) => cached(meta, f, ctx, depth, out, |out| {
                 if let Got::Ref(V::Arr(xs)) = lookup(f, path) {
                     let len = xs.len() as u32;
                     for (k, x) in xs.iter().enumerate() {
@@ -675,12 +702,16 @@ pub fn render(nodes: &[Node], f: &Frame, ctx: &Ctx, depth: usize, out: &mut Vec<
                     }
                 }
             }),
-            Node::Include(name) => {
+            Node::Include(_, meta) => {
                 if depth < INCLUDE_DEPTH {
-                    if let Some(t) = ctx.tpls.get(name) {
+                    let target = meta.target.get();
+                    if !target.is_null() {
+                        // The template, found once (mark): the map that holds it is not changed while renders run.
+                        let t: &Vec<Node> = unsafe { &*target };
                         // A template that reads one name besides the build-wide ones (a card, its post) renders the
                         // same for the same object: once per object, template and depth.
-                        if let Some(&y) = ctx.item.get(&(n as *const Node as usize)) {
+                        let y = meta.item.get();
+                        if y != NONE {
                             // Only for a name a loop binds (its items come round again); a render's own top-level
                             // name (the page) is met once.
                             if loop_bound(f, y) && !shadowed(f) {
@@ -691,7 +722,7 @@ pub fn render(nodes: &[Node], f: &Frame, ctx: &Ctx, depth: usize, out: &mut Vec<
                                 }
                             }
                         }
-                        cached(n, f, ctx, depth, out, |out| render(t, f, ctx, depth + 1, out));
+                        cached(meta, f, ctx, depth, out, |out| render(t, f, ctx, depth + 1, out));
                     }
                 }
             }

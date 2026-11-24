@@ -267,22 +267,69 @@ pub fn json_into(out: &mut Vec<u8>, s: &[u8]) {
 
 /// s HTML-escaped, then as the inside of a JSON string, appended to out.
 pub fn html_json_into(out: &mut Vec<u8>, s: &[u8]) {
-    out.reserve(s.len());
+    let n = s.len();
+    out.reserve(n);
     let mut run = 0;
     let mut i = next_html_json(s, 0);
-    while i < s.len() {
-        let c = s[i];
-        out.put(&s[run..i]);
-        if CLASS[c as usize] & 1 != 0 {
-            out.put(entity(c).unwrap());
-        } else {
-            json_escape(out, c);
+    while i < n {
+        // The text before the byte in one 16-byte store when it can, its escape in one 8-byte store (room made for
+        // both and 16 more).
+        let gap = i - run;
+        if out.capacity() - out.len() < gap + 32 {
+            out.reserve(gap + 32);
+        }
+        unsafe {
+            let len = out.len();
+            let o = out.as_mut_ptr().add(len);
+            if gap <= 16 && run + 16 <= n {
+                (o as *mut [u8; 16]).write_unaligned((s.as_ptr().add(run) as *const [u8; 16]).read_unaligned());
+            } else {
+                core::ptr::copy_nonoverlapping(s.as_ptr().add(run), o, gap);
+            }
+            let (w, l) = HTML_JSON[s[i] as usize];
+            (o.add(gap) as *mut u64).write_unaligned(w);
+            out.set_len(len + gap + l as usize);
         }
         run = i + 1;
         i = next_html_json(s, i + 1);
     }
     out.put(&s[run..]);
 }
+
+/// What html_json_into writes for a byte HTML or JSON escaping changes: its HTML entity (as entity() has it) or else
+/// its JSON escape (as json_escape() writes it), little-endian in a u64, and its length.
+const HTML_JSON: [(u64, u8); 256] = {
+    const fn pack(s: &[u8]) -> (u64, u8) {
+        let mut v = 0u64;
+        let mut i = 0;
+        while i < s.len() {
+            v |= (s[i] as u64) << (8 * i);
+            i += 1;
+        }
+        (v, s.len() as u8)
+    }
+    const H: &[u8; 16] = b"0123456789abcdef";
+    let mut t = [(0u64, 0u8); 256];
+    let mut c = 0;
+    while c < 0x20 {
+        t[c] = match c {
+            8 => pack(b"\\b"),
+            9 => pack(b"\\t"),
+            10 => pack(b"\\n"),
+            12 => pack(b"\\f"),
+            13 => pack(b"\\r"),
+            _ => pack(&[b'\\', b'u', b'0', b'0', H[c >> 4], H[c & 15]]),
+        };
+        c += 1;
+    }
+    t[b'\\' as usize] = pack(b"\\\\");
+    t[b'&' as usize] = pack(b"&amp;");
+    t[b'<' as usize] = pack(b"&lt;");
+    t[b'>' as usize] = pack(b"&gt;");
+    t[b'"' as usize] = pack(b"&quot;");
+    t[b'\'' as usize] = pack(b"&#39;");
+    t
+};
 
 /// A fast hash for the build's small maps and sets (FxHash: one multiply per 8 bytes).
 #[derive(Default, Clone, Copy)]
@@ -493,27 +540,37 @@ pub fn slug_ascii(t: &[u8]) -> Option<Vec<u8>> {
     if !t.is_ascii() {
         return None;
     }
-    let mut out = Vec::with_capacity(t.len().min(64));
+    // Written into a buffer of the 64 bytes a slug keeps; k counts them all, and once past 64 nothing more changes
+    // what is kept (a dash is only ever written before a letter or digit, so only a cut slug can end in one).
+    let mut buf = [0u8; 64];
+    let mut k = 0usize;
     let mut gap = false;
     for &c0 in t {
         let c = c0.to_ascii_lowercase();
         if !(c.is_ascii_lowercase() || c.is_ascii_digit()) {
-            gap = !out.is_empty();
+            gap = k > 0;
             continue;
         }
         if gap {
-            out.push(b'-');
+            if k < 64 {
+                buf[k] = b'-';
+            }
+            k += 1;
         }
         gap = false;
-        out.push(c);
-    }
-    if out.len() > 64 {
-        out.truncate(64);
-        if out[63] == b'-' {
-            out.truncate(63);
+        if k < 64 {
+            buf[k] = c;
+        }
+        k += 1;
+        if k > 64 {
+            break;
         }
     }
-    Some(if out.is_empty() { b"untitled".to_vec() } else { out })
+    let mut len = k.min(64);
+    if k > 64 && buf[63] == b'-' {
+        len = 63;
+    }
+    Some(if len == 0 { b"untitled".to_vec() } else { buf[..len].to_vec() })
 }
 
 pub fn unique_slug(slug: &[u8], taken: &mut Set<Vec<u8>>) -> Vec<u8> {
@@ -547,6 +604,49 @@ pub fn long_date(d: &[u8]) -> Vec<u8> {
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
+
+/// Every index of b in s, in order, handed to f (sixteen bytes at a time, each block's hits by its bit mask).
+#[inline]
+pub fn each_byte(s: &[u8], b: u8, mut f: impl FnMut(usize)) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let n = s.len();
+        let p = s.as_ptr();
+        let needle = _mm_set1_epi8(b as i8);
+        let mut i = 0;
+        while i + 16 <= n {
+            let mut m = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128(p.add(i) as *const __m128i), needle)) as u32;
+            while m != 0 {
+                f(i + m.trailing_zeros() as usize);
+                m &= m - 1;
+            }
+            i += 16;
+        }
+        if i < n && n >= 16 {
+            // The last 16 bytes, those already seen left out.
+            let base = n - 16;
+            let mut m = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128(p.add(base) as *const __m128i), needle)) as u32;
+            m &= !((1u32 << (i - base)) - 1);
+            while m != 0 {
+                f(base + m.trailing_zeros() as usize);
+                m &= m - 1;
+            }
+            return;
+        }
+        while i < n {
+            if *p.add(i) == b {
+                f(i);
+            }
+            i += 1;
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    for (i, &c) in s.iter().enumerate() {
+        if c == b {
+            f(i);
+        }
+    }
+}
 
 /// The first b in s.
 #[cfg(target_arch = "x86_64")]
